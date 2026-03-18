@@ -5,9 +5,12 @@ Step 1: estimate WF→AP time offset via all-pairs histogram.
         Every correct WF↔AP pair contributes one count to the peak bin at the
         true offset; wrong pairings scatter across bins at ±k·ITI. With ~600
         correct pairs the peak is unambiguous regardless of missing pulses.
+        Amplitude convention: amp[j] in WaveformSequence is queued at time[j] for
+        the pulse that fires at time[j+1]. The filter is applied on original indices
+        so amp[j] always pairs with time[j+1] from the original CSV.
 Step 2: nearest-neighbour match each WF entry to its closest AP onset within
-        MAX_TOL_S. Sub-threshold entries (filtered by min_amplitude_v) are dropped
-        before matching; remaining unmatched entries are classified as missed_wf.
+        MAX_TOL_S. Sub-threshold entries (dropped by min_amplitude_v) have no
+        NIDQ pulse and are excluded; remaining unmatched entries → missed_wf.
 """
 
 from pathlib import Path
@@ -46,15 +49,25 @@ def match_amplitudes(ap_onsets: np.ndarray,
     pd.DataFrame  columns: onset_time_s, amplitude_v
         One row per matched pulse; missed WF entries are excluded.
     """
-    df_wf = pd.read_csv(waveform_csv)
-    if min_amplitude_v is not None:
-        n_dropped = int((df_wf["Amplitude(V)"] < min_amplitude_v).sum())
-        if n_dropped:
-            print(f"  Dropped {n_dropped} sub-threshold WF entries (amp < {min_amplitude_v} V)")
-        df_wf = df_wf[df_wf["Amplitude(V)"] >= min_amplitude_v].reset_index(drop=True)
+    df_wf    = pd.read_csv(waveform_csv)
+    times_all = df_wf["Time(s)"].values
+    amps_all  = df_wf["Amplitude(V)"].values
 
-    wf_times = df_wf["Time(s)"].values
-    wf_amps  = df_wf["Amplitude(V)"].values
+    # amp[j] is queued at time[j] for the pulse that fires at time[j+1].
+    # Filter on original indices so amp[j] always pairs with time[j+1] from the
+    # original CSV, not with the next filtered time (which would skip gaps).
+    keep = amps_all[:-1] >= min_amplitude_v if min_amplitude_v is not None else slice(None)
+    n_dropped = int((amps_all < min_amplitude_v).sum()) if min_amplitude_v is not None else 0
+    if n_dropped:
+        print(f"  Dropped {n_dropped} sub-threshold WF entries (amp < {min_amplitude_v} V)")
+    wf_times = times_all[1:][keep]
+    wf_amps  = amps_all[:-1][keep]
+
+    # last row: amp[-1] queued for a pulse beyond time[-1]; estimate onset via median ITI
+    if min_amplitude_v is None or amps_all[-1] >= min_amplitude_v:
+        iti = float(np.median(np.diff(times_all)))
+        wf_times = np.append(wf_times, times_all[-1] + iti)
+        wf_amps  = np.append(wf_amps,  amps_all[-1])
 
     offset = _estimate_offset(wf_times, ap_onsets)
     wf_ap  = wf_times + offset
