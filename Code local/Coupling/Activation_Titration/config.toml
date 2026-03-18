@@ -1,0 +1,19 @@
+[spike_processing]
+refractory_period_ms = 1.5    # spikes closer than this are filtered
+quality_filter = "good"       # "good", "mua", or "all"
+
+[files]
+# file naming conventions (change only if non-standard)
+ks_dir = "ks"
+user_meta = "meta.txt"
+area_depths = "area_depths.csv"
+output_dir = "output"  # relative to each session's recording_dir
+
+[alignment]
+min_amplitude_v = 0.02  # drop WF entries below this; 0.015 V pulses are sub-threshold
+
+[opto]
+ramp_up = 4 # ms
+ramp_down = 4 # ms
+hold = 20 # ms
+

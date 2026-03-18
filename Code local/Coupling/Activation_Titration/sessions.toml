@@ -1,0 +1,10 @@
+[sessions]
+dirs = [
+    # "/mnt/DATA/Coupling/2026_01_21_027667_calibrationtest_g0",
+    "/mnt/DATA/Coupling/2026_02_24_Calibration1_g0",
+    #"/mnt/DATA/Coupling/2026_02_24_Calibration2_g0",
+    #"/mnt/DATA/Coupling/2026_02_25_Calibration1_g0",
+    #"/mnt/DATA/Coupling/2026_02_25_Calibration2_g0",
+    #"/mnt/DATA/Coupling/2026_02_26_Calibration1_g0",
+    #"/mnt/DATA/Coupling/2026_02_26_Calibration2_g0"
+]
