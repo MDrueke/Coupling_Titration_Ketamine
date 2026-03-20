@@ -38,8 +38,8 @@ PSTH_POST_WINDOW = 40.0  # ms after onset
 PSTH_BIN_SIZE = 2.5  # ms
 PSTH_AMPLITUDE_RANGE = (4.0, 5.0)  # (min, max) V — pulses used for PSTH
 STIM_DURATION_MS = 28.0
-INTERPOLATE_ARTIFACT = True  # interpolate across stimulation artifact
-ARTIFACT_WINDOW_MS = (0.0, 3.0)  # ms post-onset to interpolate across
+INTERPOLATE_ARTIFACT = True  # interpolate across stimulation artifacts
+ARTIFACT_WINDOWS_MS = [(0.0, 3.0), (26.0, 30.0)]  # (start, end) ms post-onset
 
 ALPHA = 0.05  # FDR threshold for Wilcoxon + B-H correction
 
@@ -297,14 +297,15 @@ def calculate_psth(
     bin_edges = np.arange(-pre_s, post_s + bin_s, bin_s)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2 * 1000  # ms
 
-    # bins that overlap with the artifact window [art_start, art_end)
+    # for each artifact window, find bins that overlap with it
+    bin_edges_ms = bin_edges * 1000
+    artifact_idx_list = []
     if INTERPOLATE_ARTIFACT:
-        art_start, art_end = ARTIFACT_WINDOW_MS
-        bin_edges_ms = bin_edges * 1000
-        artifact_mask = (bin_edges_ms[:-1] < art_end) & (bin_edges_ms[1:] > art_start)
-        artifact_idx = np.where(artifact_mask)[0]
-    else:
-        artifact_idx = np.array([], dtype=int)
+        for art_start, art_end in ARTIFACT_WINDOWS_MS:
+            mask = (bin_edges_ms[:-1] < art_end) & (bin_edges_ms[1:] > art_start)
+            idx = np.where(mask)[0]
+            if len(idx):
+                artifact_idx_list.append(idx)
 
     amp_mask = (amplitudes >= PSTH_AMPLITUDE_RANGE[0]) & (
         amplitudes <= PSTH_AMPLITUDE_RANGE[1]
@@ -327,9 +328,9 @@ def calculate_psth(
             )
             trial_rates.append(counts / bin_s)
         neuron_avg = np.mean(trial_rates, axis=0)
-        if len(artifact_idx) > 0:
-            i0 = artifact_idx[0] - 1  # last pre-artifact bin
-            i1 = artifact_idx[-1] + 1  # first post-artifact bin
+        for artifact_idx in artifact_idx_list:
+            i0 = artifact_idx[0] - 1
+            i1 = artifact_idx[-1] + 1
             if 0 <= i0 and i1 < len(neuron_avg):
                 neuron_avg[artifact_idx] = np.interp(
                     artifact_idx, [i0, i1], [neuron_avg[i0], neuron_avg[i1]]
