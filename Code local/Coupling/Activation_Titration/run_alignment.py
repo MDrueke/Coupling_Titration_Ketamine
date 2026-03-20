@@ -17,7 +17,7 @@ from align_datastreams import DataStreamAligner
 from match_amplitudes import match_amplitudes
 from recording import resolve_session_paths
 
-RECOMPUTE = True  # set True to redo everything even if stim_amplitudes.csv exists
+RECOMPUTE = False  # set True to redo everything even if stim_amplitudes.csv exists
 
 
 def load_config(path="config.toml"):
@@ -28,7 +28,7 @@ def load_config(path="config.toml"):
 SYNC_PARAMS = {
     "target_duration_ms": 500.0,
     "tolerance_ms": 5.0,
-    "merge_gap_ms": 0.0,
+    "merge_gap_ms": 3.0,  # merge noise fragments within a single sync pulse
     "max_trim": 1,
 }
 SYNC_BIT_AP = 6  # bit #6 of last channel in AP
@@ -89,13 +89,18 @@ def run_alignment(session_dir: Path, config: dict):
         channel_number=7,
         pulse_params=STIM_PARAMS,
     )
-    print(f"\n  Aligned {len(aligned_stim)} pulses")
+    _TEAL = "\033[38;2;187;230;228m"
+    _RESET = "\033[0m"
+
+    print(f"{_TEAL}\n  Aligned {len(aligned_stim)} pulses{_RESET}")
 
     # --- 2. Split at largest ITI gap (awake → ketamine transition) ---
     split_at = int(np.argmax(np.diff(aligned_stim))) + 1
     awake_pulses = aligned_stim[:split_at]
     keta_pulses = aligned_stim[split_at:]
-    print(f"  Block split: {len(awake_pulses)} awake | {len(keta_pulses)} keta")
+    print(
+        f"{_TEAL}  Block split: {len(awake_pulses)} awake | {len(keta_pulses)} keta{_RESET}"
+    )
 
     min_amp = config.get("alignment", {}).get("min_amplitude_v", None)
 
@@ -117,7 +122,7 @@ def run_alignment(session_dir: Path, config: dict):
         diag_dir=output_dir,
     )
 
-    # --- 5. Residual diagnostic plot ---
+    # --- 4. Residual diagnostic plot ---
     plot_match_residuals(output_dir)
 
     # --- 5. Combine and save ---
@@ -180,7 +185,7 @@ def plot_match_residuals(output_dir: Path):
                 print(f"  [warn] {csv_path.name} not found — skipping residual plot")
                 continue
             df = pd.read_csv(csv_path)
-            matched = df[df["status"] == "matched"].copy()
+            matched = df[df["status"] == "matched"].copy()  # excludes matched_extrap
             missed = df[df["status"] == "missed_wf"]
             spur = df[df["status"] == "spurious_ap"]
 
@@ -195,7 +200,7 @@ def plot_match_residuals(output_dir: Path):
             ax_ts = axes[row, 0]
             ax_his = axes[row, 1]
 
-            ax_ts.scatter(t, r_ms, s=8, color=color, alpha=0.5, linewidths=0)
+            ax_ts.scatter(t, r_ms, s=16, color=color, alpha=0.7, linewidths=0)
             ax_ts.plot(
                 t,
                 trend,

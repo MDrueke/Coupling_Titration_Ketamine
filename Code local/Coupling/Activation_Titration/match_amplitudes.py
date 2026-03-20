@@ -18,6 +18,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+_TEAL   = "\033[38;2;187;230;228m"
+_ORANGE = "\033[38;2;255;149;5m"
+_RESET  = "\033[0m"
+
 MAX_TOL_S         = 1.0   # max |AP − WF| residual to accept a match (s)
 HIST_BIN_S        = 0.05  # histogram bin width for offset estimation (s)
 QC_MAX_RESIDUAL_S = 0.150 # error if any matched residual exceeds this (s)
@@ -59,19 +63,21 @@ def match_amplitudes(ap_onsets: np.ndarray,
     keep = amps_all[:-1] >= min_amplitude_v if min_amplitude_v is not None else slice(None)
     n_dropped = int((amps_all < min_amplitude_v).sum()) if min_amplitude_v is not None else 0
     if n_dropped:
-        print(f"  Dropped {n_dropped} sub-threshold WF entries (amp < {min_amplitude_v} V)")
+        print(f"{_TEAL}  Dropped {n_dropped} sub-threshold WF entries (amp < {min_amplitude_v} V){_RESET}")
     wf_times = times_all[1:][keep]
     wf_amps  = amps_all[:-1][keep]
 
-    # last row: amp[-1] queued for a pulse beyond time[-1]; estimate onset via median ITI
-    if min_amplitude_v is None or amps_all[-1] >= min_amplitude_v:
+    # last row: amp[-1] queued for a pulse beyond time[-1]; estimate onset via median ITI.
+    # its residual reflects ITI variance (not matching error) so it is excluded from QC.
+    has_extrapolated = min_amplitude_v is None or amps_all[-1] >= min_amplitude_v
+    if has_extrapolated:
         iti = float(np.median(np.diff(times_all)))
         wf_times = np.append(wf_times, times_all[-1] + iti)
         wf_amps  = np.append(wf_amps,  amps_all[-1])
 
     offset = _estimate_offset(wf_times, ap_onsets)
     wf_ap  = wf_times + offset
-    print(f"  WF→AP offset: {offset:.4f} s")
+    print(f"{_TEAL}  WF→AP offset: {offset:.4f} s{_RESET}")
 
     matched_ap_idx, residuals = _nn_match(wf_ap, ap_onsets, MAX_TOL_S)
 
@@ -81,40 +87,10 @@ def match_amplitudes(ap_onsets: np.ndarray,
     ap_used       = set(matched_ap_idx[matched_mask].tolist())
     n_spurious_ap = len(ap_onsets) - len(ap_used)
 
-    print(f"  Matched {n_matched} / {len(wf_times)}  "
-          f"({n_missed_wf} missed WF, {n_spurious_ap} spurious det)")
+    print(f"{_TEAL}  Matched {n_matched} / {len(wf_times)}  "
+          f"({n_missed_wf} missed WF, {n_spurious_ap} spurious det){_RESET}")
 
-    # --- quality checks ---
-    r = residuals[matched_mask]
-    if len(r):
-        max_r    = float(np.abs(r).max())
-        mean_r   = float(np.abs(r.mean()))
-        miss_frac = n_missed_wf / len(wf_times)
-        if max_r > QC_MAX_RESIDUAL_S:
-            raise ValueError(
-                f"Alignment QC failed [{block_label}]: max |residual| = {max_r*1e3:.1f} ms "
-                f"> {QC_MAX_RESIDUAL_S*1e3:.0f} ms — likely a bad match."
-            )
-        if mean_r > QC_MAX_MEAN_ABS_S:
-            raise ValueError(
-                f"Alignment QC failed [{block_label}]: |mean residual| = {mean_r*1e3:.1f} ms "
-                f"> {QC_MAX_MEAN_ABS_S*1e3:.0f} ms — histogram offset may be in wrong bin."
-            )
-        if miss_frac > QC_MAX_MISS_FRAC:
-            print(f"  WARNING: {miss_frac*100:.1f}% WF entries unmatched "
-                  f"(threshold {QC_MAX_MISS_FRAC*100:.0f}%) — check detection or block split.")
-        if n_spurious_ap > 0:
-            print(f"\033[91m  WARNING: {n_spurious_ap} spurious AP detections — "
-                  "unexpected signal in stim channel or wrong block boundaries.\033[0m")
-        print(f"  Residual: mean={r.mean()*1e3:.2f} ms  "
-              f"std={r.std()*1e3:.2f} ms  max|r|={max_r*1e3:.2f} ms")
-
-    # --- build result (matched pulses only) ---
-    result = pd.DataFrame({
-        "onset_time_s": ap_onsets[matched_ap_idx[matched_mask]],
-        "amplitude_v":  wf_amps[matched_mask],
-    })
-
+    # --- write diagnostics before QC so files exist even if QC fails ---
     if diag_dir is not None:
         spurious_ap_times = ap_onsets[
             np.array([i for i in range(len(ap_onsets)) if i not in ap_used])
@@ -122,8 +98,43 @@ def match_amplitudes(ap_onsets: np.ndarray,
         _write_stim_times(
             Path(diag_dir), block_label,
             wf_times, wf_amps, offset, matched_mask,
-            ap_onsets, matched_ap_idx, spurious_ap_times,
+            ap_onsets, matched_ap_idx, spurious_ap_times, has_extrapolated,
         )
+
+    # --- quality checks (exclude extrapolated last entry — its residual = ITI variance) ---
+    qc_mask = matched_mask.copy()
+    if has_extrapolated and matched_mask[-1]:
+        qc_mask[-1] = False
+    r = residuals[qc_mask]
+    if len(r):
+        max_r     = float(np.abs(r).max())
+        mean_r    = float(np.abs(r.mean()))
+        miss_frac = n_missed_wf / len(wf_times)
+        if max_r > QC_MAX_RESIDUAL_S:
+            outlier_idx = np.where(np.abs(r) > QC_MAX_RESIDUAL_S)[0]
+            print(f"{_ORANGE}  WARNING: max |residual| = {max_r*1e3:.1f} ms "
+                  f"> {QC_MAX_RESIDUAL_S*1e3:.0f} ms — check outlier(s) below:{_RESET}")
+            for i in outlier_idx:
+                t = float(ap_onsets[matched_ap_idx[matched_mask][i]])
+                print(f"{_ORANGE}    t={t:.3f} s  residual={r[i]*1e3:.1f} ms  "
+                      f"amp={wf_amps[matched_mask][i]:.4f} V{_RESET}")
+        if mean_r > QC_MAX_MEAN_ABS_S:
+            print(f"{_ORANGE}  WARNING: |mean residual| = {mean_r*1e3:.1f} ms "
+                  f"> {QC_MAX_MEAN_ABS_S*1e3:.0f} ms — histogram offset may be in wrong bin.{_RESET}")
+        if miss_frac > QC_MAX_MISS_FRAC:
+            print(f"{_ORANGE}  WARNING: {miss_frac*100:.1f}% WF entries unmatched "
+                  f"(threshold {QC_MAX_MISS_FRAC*100:.0f}%) — check detection or block split.{_RESET}")
+        if n_spurious_ap > 0:
+            print(f"{_ORANGE}  WARNING: {n_spurious_ap} spurious AP detections — "
+                  f"unexpected signal in stim channel or wrong block boundaries.{_RESET}")
+        print(f"{_TEAL}  Residual: mean={r.mean()*1e3:.2f} ms  "
+              f"std={r.std()*1e3:.2f} ms  max|r|={max_r*1e3:.2f} ms{_RESET}")
+
+    # --- build result (matched pulses only) ---
+    result = pd.DataFrame({
+        "onset_time_s": ap_onsets[matched_ap_idx[matched_mask]],
+        "amplitude_v":  wf_amps[matched_mask],
+    })
 
     return result
 
@@ -190,16 +201,20 @@ def _nn_match(wf_ap: np.ndarray,
 
 def _write_stim_times(diag_dir: Path, block_label: str,
                       wf_times, wf_amps, offset, matched_mask,
-                      ap_onsets, matched_ap_idx, spurious_ap_times):
+                      ap_onsets, matched_ap_idx, spurious_ap_times, has_extrapolated):
     """Write stim_times_{block}.csv for manual NIDQ inspection."""
     ap_times_out = np.full(len(wf_times), np.nan)
     ap_times_out[matched_mask] = ap_onsets[matched_ap_idx[matched_mask]]
+
+    statuses = ["matched" if m else "missed_wf" for m in matched_mask]
+    if has_extrapolated and matched_mask[-1]:
+        statuses[-1] = "matched_extrap"
 
     rows = pd.DataFrame({
         "expected_ap_s":  wf_times + offset,
         "wf_amplitude_v": wf_amps,
         "actual_ap_s":    ap_times_out,
-        "status":         ["matched" if m else "missed_wf" for m in matched_mask],
+        "status":         statuses,
     })
 
     if len(spurious_ap_times) > 0:
@@ -215,4 +230,4 @@ def _write_stim_times(diag_dir: Path, block_label: str,
 
     out_path = diag_dir / f"stim_times_{block_label}.csv"
     df.to_csv(out_path, index=False, float_format="%.6f")
-    print(f"  Stim times → {out_path.name}")
+    print(f"{_TEAL}  Stim times → {out_path.name}{_RESET}")

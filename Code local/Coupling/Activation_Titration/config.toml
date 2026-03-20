@@ -1,5 +1,5 @@
 [spike_processing]
-refractory_period_ms = 1.5    # spikes closer than this are filtered
+refractory_period_ms = 0.5    # spikes closer than this are filtered
 quality_filter = "good"       # "good", "mua", or "all"
 
 [files]
@@ -7,7 +7,8 @@ quality_filter = "good"       # "good", "mua", or "all"
 ks_dir = "ks"
 user_meta = "meta.txt"
 area_depths = "area_depths.csv"
-output_dir = "output"  # relative to each session's recording_dir
+output_dir = "output"           # relative to each session's recording_dir
+pooled_output_dir = "output_pooled"  # absolute or relative to cwd
 
 [alignment]
 min_amplitude_v = 0.02  # drop WF entries below this; 0.015 V pulses are sub-threshold
@@ -16,4 +17,3 @@ min_amplitude_v = 0.02  # drop WF entries below this; 0.015 V pulses are sub-thr
 ramp_up = 4 # ms
 ramp_down = 4 # ms
 hold = 20 # ms
-

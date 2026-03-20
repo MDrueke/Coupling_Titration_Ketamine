@@ -26,6 +26,11 @@ except ImportError:
 
 
 
+_TEAL   = "\033[38;2;187;230;228m"
+_ORANGE = "\033[38;2;255;149;5m"
+_RESET  = "\033[0m"
+
+
 def read_meta(bin_path: Path) -> dict:
     """Parse SGLX meta file into dictionary. Works for .bin and .cbin (replaces last suffix)."""
     meta_path = Path(bin_path).with_suffix(".meta")
@@ -100,43 +105,56 @@ def extract_digital_channel(raw_data: np.memmap, channel_idx: int) -> np.ndarray
 
 def merge_nearby_pulses(onset_samples: np.ndarray, offset_samples: np.ndarray,
                        sample_rate: float, max_gap_ms: float = 1.0,
-                       target_duration_ms: float = 28.0, 
+                       target_duration_ms: float = 28.0,
                        tolerance_ms: float = 5.0) -> tuple:
-    """Merge consecutive pulses separated by short gaps."""
+    """Merge clusters of pulses separated by short gaps if the cluster span matches target duration.
+
+    Groups all consecutive pulses with inter-pulse gaps <= max_gap_ms into a cluster.
+    If the cluster's total span (last offset - first onset) is within tolerance of
+    target_duration_ms, the entire cluster is replaced by a single pulse. This handles
+    noisy pulses that fragment into many short sub-pulses.
+    """
     if len(onset_samples) == 0:
         return onset_samples, offset_samples
-    
+
     max_gap_samples = int((max_gap_ms / 1000) * sample_rate)
-    min_combined_dur = target_duration_ms - tolerance_ms
-    max_combined_dur = target_duration_ms + tolerance_ms
-    
+    min_span = (target_duration_ms - tolerance_ms) / 1000 * sample_rate
+    max_span = (target_duration_ms + tolerance_ms) / 1000 * sample_rate
+
     merged_onsets = []
     merged_offsets = []
-    
+
     i = 0
     while i < len(onset_samples):
-        current_onset = onset_samples[i]
-        current_offset = offset_samples[i]
-        
-        if i + 1 < len(onset_samples):
-            next_onset = onset_samples[i + 1]
-            gap = next_onset - current_offset
-            
+        # greedily extend cluster while consecutive gap is small
+        j = i
+        cluster_end = offset_samples[i]
+        while j + 1 < len(onset_samples):
+            gap = onset_samples[j + 1] - offset_samples[j]
             if gap <= max_gap_samples:
-                next_offset = offset_samples[i + 1]
-                combined_duration_samples = next_offset - current_onset
-                combined_duration_ms = (combined_duration_samples / sample_rate) * 1000
-                
-                if min_combined_dur <= combined_duration_ms <= max_combined_dur:
-                    merged_onsets.append(current_onset)
-                    merged_offsets.append(next_offset)
-                    i += 2
-                    continue
-        
-        merged_onsets.append(current_onset)
-        merged_offsets.append(current_offset)
-        i += 1
-    
+                j += 1
+                cluster_end = offset_samples[j]
+            else:
+                break
+
+        if j > i:
+            # multi-pulse cluster: merge if span matches target duration
+            span = cluster_end - onset_samples[i]
+            if min_span <= span <= max_span:
+                merged_onsets.append(onset_samples[i])
+                merged_offsets.append(cluster_end)
+                i = j + 1
+                continue
+            # span doesn't match — keep individual pulses (they'll be filtered by duration)
+            for k in range(i, j + 1):
+                merged_onsets.append(onset_samples[k])
+                merged_offsets.append(offset_samples[k])
+            i = j + 1
+        else:
+            merged_onsets.append(onset_samples[i])
+            merged_offsets.append(offset_samples[i])
+            i += 1
+
     return np.array(merged_onsets), np.array(merged_offsets)
 
 
@@ -177,10 +195,10 @@ def extract_pulses_with_duration(pulse_data: np.ndarray, sample_rate: float,
     if n_rejected > 0:
         rejected_times = onset_samples[~mask] / sample_rate
         rejected_durs = durations_ms[~mask]
-        print(f"  Duration filter: rejected {n_rejected} pulse(s) outside "
-              f"{min_dur:.1f}–{max_dur:.1f} ms window:")
+        print(f"{_TEAL}  Duration filter: rejected {n_rejected} pulse(s) outside "
+              f"{min_dur:.1f}–{max_dur:.1f} ms window:{_RESET}")
         for t, d in zip(rejected_times, rejected_durs):
-            print(f"    t={t:.3f} s  dur={d:.2f} ms")
+            print(f"{_TEAL}    t={t:.3f} s  dur={d:.2f} ms{_RESET}")
 
     return onset_samples[mask] / sample_rate
 
@@ -256,7 +274,7 @@ class DataStreamAligner:
             ref_dig[reference_sync_bit], self.reference_sample_rate, **self.sync_params
         )
         
-        print(f"  Found {len(self.reference_sync_onsets)} sync pulses")
+        print(f"{_TEAL}  Found {len(self.reference_sync_onsets)} sync pulses{_RESET}")
         if self.check_sync_ipi:
             self.reference_sync_onsets = self._check_ipi(self.reference_sync_onsets, "reference")
 
@@ -274,10 +292,6 @@ class DataStreamAligner:
         if len(onsets) < 2:
             return onsets
 
-        ORANGE = "\033[1;33m"
-        RED = "\033[1;31m"
-        RESET = "\033[0m"
-
         ipis = np.diff(onsets)
         median_ipi = float(np.median(ipis))
 
@@ -285,9 +299,9 @@ class DataStreamAligner:
         short_idx = np.where(ipis < 0.5 * median_ipi)[0]
         for i in short_idx:
             print(
-                f"{RED}  !!! WARNING: SHORT IPI in '{stream_name}' between pulses "
+                f"{_ORANGE}  !!! WARNING: SHORT IPI in '{stream_name}' between pulses "
                 f"{i} and {i+1}: {ipis[i]*1000:.1f} ms "
-                f"(expected ~{median_ipi*1000:.0f} ms) — possible spurious pulse !!!{RESET}"
+                f"(expected ~{median_ipi*1000:.0f} ms) — possible spurious pulse !!!{_RESET}"
             )
 
         # fill long IPIs (> 150% of expected) with synthetic pulses
@@ -303,10 +317,10 @@ class DataStreamAligner:
             for j in range(n_missing):
                 corrected.insert(adj_i + j + 1, corrected[adj_i] + (j + 1) * median_ipi)
             print(
-                f"{ORANGE}  !!! WARNING: MISSING SYNC PULSE in '{stream_name}' after pulse {i} "
+                f"{_ORANGE}  !!! WARNING: MISSING SYNC PULSE in '{stream_name}' after pulse {i} "
                 f"(t={onsets[i]:.3f} s): IPI = {ipis[i]*1000:.1f} ms, "
                 f"expected ~{median_ipi*1000:.0f} ms. "
-                f"Inserted {n_missing} synthetic pulse(s). !!!{RESET}"
+                f"Inserted {n_missing} synthetic pulse(s). !!!{_RESET}"
             )
             offset += n_missing
 
@@ -351,7 +365,7 @@ class DataStreamAligner:
             target_dig[target_sync_bit], target_sample_rate, **self.sync_params
         )
 
-        print(f"  Found {len(target_sync_onsets)} sync pulses")
+        print(f"{_TEAL}  Found {len(target_sync_onsets)} sync pulses{_RESET}")
         if self.check_sync_ipi:
             target_sync_onsets = self._check_ipi(target_sync_onsets, stream_name)
 
@@ -406,10 +420,8 @@ class DataStreamAligner:
                     f"  Sync line was LOW at {edge_label} sample of {longer} — extra pulse cause unclear; check data."
                 )
 
-                ORANGE = "\033[1;33m"
-                RESET = "\033[0m"
-                print(f"{ORANGE}  !!! WARNING: TRIMMED {diff} SYNC PULSE(S) FROM {trim_end.upper()} OF {longer.upper()} !!!")
-                print(f"  Counts now match: {n_keep}{RESET}")
+                print(f"{_ORANGE}  !!! WARNING: TRIMMED {diff} SYNC PULSE(S) FROM {trim_end.upper()} OF {longer.upper()} !!!")
+                print(f"  Counts now match: {n_keep}{_RESET}")
                 print(truncation_msg)
             else:
                 raise ValueError(
@@ -424,9 +436,9 @@ class DataStreamAligner:
         drift = self.reference_sync_onsets - target_sync_onsets
         max_drift = np.max(np.abs(drift))
         
-        print(f"  Max drift: {max_drift*1000:.2f} ms")
+        print(f"{_TEAL}  Max drift: {max_drift*1000:.2f} ms{_RESET}")
         if max_drift > 0.1:  # 100ms
-            print(f"  WARNING: Drift exceeds 100ms threshold!")
+            print(f"{_ORANGE}  WARNING: Drift exceeds 100ms threshold!{_RESET}")
         
         # Store stream info
         self.target_streams[stream_name] = {
@@ -491,7 +503,7 @@ class DataStreamAligner:
             dig_array[channel_number], stream["sample_rate"], **pulse_params
         )
         
-        print(f"  Extracted {len(event_onsets)} events")
+        print(f"{_TEAL}  Extracted {len(event_onsets)} events{_RESET}")
         
         # Correct times
         aligned_onsets = self._correct_times(event_onsets, stream_name)

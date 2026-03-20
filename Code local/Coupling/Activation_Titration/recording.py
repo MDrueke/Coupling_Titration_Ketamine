@@ -5,13 +5,16 @@ This module provides a unified interface for loading spike sorting results,
 metadata, and probe geometry from a single Neuropixels recording session.
 """
 
+import numbers
+import re
 from pathlib import Path
 from typing import Dict, Tuple
-import re
-import numbers
 
 import numpy as np
 import pandas as pd
+
+_TEAL  = "\033[38;2;187;230;228m"
+_RESET = "\033[0m"
 
 
 def resolve_session_paths(top_dir: Path) -> dict:
@@ -38,7 +41,7 @@ def resolve_session_paths(top_dir: Path) -> dict:
         "recording_dir": recording_dirs[0],
         "nidq_file": nidq_files[0],
         "waveform_csv_awake": top_dir / "WaveformSequence_awake.csv",
-        "waveform_csv_keta": top_dir / "WaveformSequence_Keta.csv",
+        "waveform_csv_keta": top_dir / "WaveformSequence_keta.csv",
     }
 
 
@@ -245,7 +248,9 @@ def _geometry_from_meta(meta_data: dict, nc: int = 384) -> dict:
             th["col"] = -cm["col"] * 2 + 2 + np.mod(cm["row"], 2)
         th.update(_rc2xy(th["row"], th["col"], version=major_version))
 
-    th["sample_shift"], th["adc"] = _adc_shifts(version=major_version, nc=th["col"].size)
+    th["sample_shift"], th["adc"] = _adc_shifts(
+        version=major_version, nc=th["col"].size
+    )
     th = _split_geometry_into_shanks(th, meta_data)
     th["ind"] = np.arange(th["col"].size)
 
@@ -325,7 +330,9 @@ class Recording:
 
         # layer distribution
         layer_counts = self.clusterInfo["layer"].value_counts().to_dict()
-        layer_str = ", ".join(f"{k}: {v}" for k, v in sorted(layer_counts.items()) if k is not None)
+        layer_str = ", ".join(
+            f"{k}: {v}" for k, v in sorted(layer_counts.items()) if k is not None
+        )
         unassigned = self.clusterInfo["layer"].isna().sum()
 
         # geometry info
@@ -343,11 +350,14 @@ class Recording:
             f"  Total spikes:  {total_spikes:,}",
             f"  Layer depths:  {len(self.areaDepths)} layers defined",
             f"  Layer assign:  {layer_str}",
-            f"  State times:   " + (
+            f"  State times:   "
+            + (
                 ", ".join(
                     f"{k} {v[0]:.0f}–{'end' if np.isinf(v[1]) else f'{v[1]:.0f}'} min"
                     for k, v in self.stateTimes.items()
-                ) if self.stateTimes else "not specified"
+                )
+                if self.stateTimes
+                else "not specified"
             ),
         ]
         if unassigned > 0:
@@ -479,12 +489,13 @@ class Recording:
                     self.surfaceChan = int(value)
                 elif key == "region":
                     self.region = value
-                elif key in ("awake", "ketamine"):
+                elif key in ("awake", "ketamine", "keta"):
                     # expect: <key> <start> - <end>  (times in minutes; "end" → np.inf)
                     time_parts = [p for p in parts[1:] if p != "-"]
                     start = float(time_parts[0])
                     end = np.inf if time_parts[1] == "end" else float(time_parts[1])
-                    self.stateTimes[key] = (start, end)
+                    canonical = "ketamine" if key == "keta" else key
+                    self.stateTimes[canonical] = (start, end)
 
         if self.surfaceChan is None:
             raise ValueError(
@@ -521,7 +532,9 @@ class Recording:
             keep = pd.Series(True, index=self.clusterInfo.index)
         n_total = len(self.clusterInfo)
         self.clusterInfo = self.clusterInfo[keep].reset_index(drop=True)
-        print(f"\t...Kept {len(self.clusterInfo)}/{n_total} clusters (quality_filter='{quality}')")
+        print(
+            f"{_TEAL}\t...Kept {len(self.clusterInfo)}/{n_total} clusters (quality_filter='{quality}'){_RESET}"
+        )
 
         good_ids = set(self.clusterInfo["cluster_id"])
 
@@ -539,7 +552,7 @@ class Recording:
             sample_rate = float(self.APmetaDict.get("imSampRate", 30000.0))
             spike_times = spike_times / sample_rate
             np.save(spike_times_sec_file, spike_times)
-            print(f"\t...Saved spike times in seconds to {spike_times_sec_file.name}")
+            print(f"{_TEAL}\t...Saved spike times in seconds to {spike_times_sec_file.name}{_RESET}")
 
         # load spike clusters
         spike_clusters_file = ks_dir / "spike_clusters.npy"
@@ -560,7 +573,9 @@ class Recording:
         spike_arrays = np.split(sorted_times, split_indices[1:])
         self.unitSpikes = dict(zip(unique_clusters, spike_arrays))
 
-        print(f"\t...Loaded {len(self.clusterInfo)} clusters, {len(spike_times)} spikes")
+        print(
+            f"{_TEAL}\t...Loaded {len(self.clusterInfo)} clusters, {len(spike_times)} spikes{_RESET}"
+        )
 
     def _load_area_depths(self) -> None:
         """Load layer boundary definitions from area_depths.csv."""
@@ -609,21 +624,14 @@ class Recording:
             self.unitSpikes[unit_id] = spike_times[keep_mask]
 
         print(
-            f"\t...Removed {total_removed} refractory violations "
-            f"({refractory_ms}ms) across {len(self.unitSpikes)} units"
+            f"{_TEAL}\t...Removed {total_removed} refractory violations "
+            f"({refractory_ms}ms) across {len(self.unitSpikes)} units{_RESET}"
         )
 
     def _assign_layers(self) -> None:
         """Assign neurons to layers based on brain depth."""
         surface_um = self.surfaceChan * 10  # 10µm spacing
-        if "brain_depth" not in self.clusterInfo.columns:
-            self.clusterInfo["brain_depth"] = self.clusterInfo["depth"] - surface_um
-        else:
-            # fill NaNs (e.g. merged units created without brain_depth during curation)
-            nan_mask = self.clusterInfo["brain_depth"].isna()
-            self.clusterInfo.loc[nan_mask, "brain_depth"] = (
-                self.clusterInfo.loc[nan_mask, "depth"] - surface_um
-            )
+        self.clusterInfo["brain_depth"] = surface_um - self.clusterInfo["depth"]
 
         self.clusterInfo["layer"] = None
 
@@ -638,7 +646,7 @@ class Recording:
 
         assigned = self.clusterInfo["layer"].notna().sum()
         total = len(self.clusterInfo)
-        print(f"\t...Assigned {assigned}/{total} clusters to layers")
+        print(f"{_TEAL}\t...Assigned {assigned}/{total} clusters to areas according to area_depths.csv{_RESET}")
 
         self.clusterInfo.to_csv(
             self.paths["ksPath"] / "cluster_info.tsv", sep="\t", index=False
