@@ -1,17 +1,4 @@
-"""
-Match NIDQ pulse onset times to amplitudes from WaveformSequence.csv.
-
-Step 1: estimate WF→AP time offset via all-pairs histogram.
-        Every correct WF↔AP pair contributes one count to the peak bin at the
-        true offset; wrong pairings scatter across bins at ±k·ITI. With ~600
-        correct pairs the peak is unambiguous regardless of missing pulses.
-        Amplitude convention: amp[j] in WaveformSequence is queued at time[j] for
-        the pulse that fires at time[j+1]. The filter is applied on original indices
-        so amp[j] always pairs with time[j+1] from the original CSV.
-Step 2: nearest-neighbour match each WF entry to its closest AP onset within
-        MAX_TOL_S. Sub-threshold entries (dropped by min_amplitude_v) have no
-        NIDQ pulse and are excluded; remaining unmatched entries → missed_wf.
-"""
+"""match NIDQ pulse onset times to amplitudes from WaveformSequence.csv."""
 
 from pathlib import Path
 
@@ -22,11 +9,11 @@ _TEAL   = "\033[38;2;187;230;228m"
 _ORANGE = "\033[38;2;255;149;5m"
 _RESET  = "\033[0m"
 
-MAX_TOL_S         = 1.0   # max |AP − WF| residual to accept a match (s)
-HIST_BIN_S        = 0.05  # histogram bin width for offset estimation (s)
-QC_MAX_RESIDUAL_S = 0.150 # error if any matched residual exceeds this (s)
-QC_MAX_MEAN_ABS_S = 0.030 # error if |mean residual| exceeds this — catches bad offset bin
-QC_MAX_MISS_FRAC  = 0.15  # warning if fraction of unmatched WF entries exceeds this
+MAX_TOL_S         = 1.0    # max |AP − WF| residual to accept a match (s)
+HIST_BIN_S        = 0.05   # histogram bin width for offset estimation (s)
+QC_MAX_RESIDUAL_S = 0.150  # error if any matched residual exceeds this (s)
+QC_MAX_MEAN_ABS_S = 0.030  # error if |mean residual| exceeds this — catches bad offset bin
+QC_MAX_MISS_FRAC  = 0.15   # warning if fraction of unmatched WF entries exceeds this
 
 
 def match_amplitudes(ap_onsets: np.ndarray,
@@ -35,23 +22,10 @@ def match_amplitudes(ap_onsets: np.ndarray,
                      min_amplitude_v: float = None,
                      diag_dir: Path = None) -> pd.DataFrame:
     """
-    Parameters
-    ----------
-    ap_onsets : np.ndarray
-        Aligned pulse onset times in AP-clock seconds.
-    waveform_csv : str
-        Path to WaveformSequence CSV with Time(s) and Amplitude(V) columns.
-    block_label : str
-        Short label used for output filenames (e.g. "awake", "keta").
-    min_amplitude_v : float, optional
-        Drop WF rows below this amplitude before matching.
-    diag_dir : Path, optional
-        If given, write stim_times_{block_label}.csv here.
+    match aligned AP onsets to WaveformSequence amplitudes.
 
-    Returns
-    -------
-    pd.DataFrame  columns: onset_time_s, amplitude_v
-        One row per matched pulse; missed WF entries are excluded.
+    amp[j] in WaveformSequence is queued at time[j] for the pulse at time[j+1].
+    Returns one row per matched pulse with columns: onset_time_s, amplitude_v.
     """
     df_wf    = pd.read_csv(waveform_csv)
     times_all = df_wf["Time(s)"].values
@@ -90,7 +64,7 @@ def match_amplitudes(ap_onsets: np.ndarray,
     print(f"{_TEAL}  Matched {n_matched} / {len(wf_times)}  "
           f"({n_missed_wf} missed WF, {n_spurious_ap} spurious det){_RESET}")
 
-    # --- write diagnostics before QC so files exist even if QC fails ---
+    # write diagnostics before QC so files exist even if QC fails
     if diag_dir is not None:
         spurious_ap_times = ap_onsets[
             np.array([i for i in range(len(ap_onsets)) if i not in ap_used])
@@ -101,7 +75,7 @@ def match_amplitudes(ap_onsets: np.ndarray,
             ap_onsets, matched_ap_idx, spurious_ap_times, has_extrapolated,
         )
 
-    # --- quality checks (exclude extrapolated last entry — its residual = ITI variance) ---
+    # quality checks (exclude extrapolated last entry — its residual = ITI variance)
     qc_mask = matched_mask.copy()
     if has_extrapolated and matched_mask[-1]:
         qc_mask[-1] = False
@@ -130,7 +104,6 @@ def match_amplitudes(ap_onsets: np.ndarray,
         print(f"{_TEAL}  Residual: mean={r.mean()*1e3:.2f} ms  "
               f"std={r.std()*1e3:.2f} ms  max|r|={max_r*1e3:.2f} ms{_RESET}")
 
-    # --- build result (matched pulses only) ---
     result = pd.DataFrame({
         "onset_time_s": ap_onsets[matched_ap_idx[matched_mask]],
         "amplitude_v":  wf_amps[matched_mask],
@@ -139,18 +112,11 @@ def match_amplitudes(ap_onsets: np.ndarray,
     return result
 
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
 def _estimate_offset(wf_times: np.ndarray, ap_onsets: np.ndarray) -> float:
-    """
-    All-pairs histogram offset estimator.
+    """all-pairs histogram estimator of WF→AP time offset.
 
-    Computes every pairwise difference ap[i] − wf[j] and finds the peak bin.
-    With N≈600 pulses the matrix is 600×600 ≈ 360 k values — trivial cost.
-    The peak bin accumulates one vote per correct pair and is separated from
-    any wrong-pairing clusters by at least one ITI (~2–4 s).
+    With N≈600 pulses the peak bin accumulates one vote per correct pair and is
+    separated from any wrong-pairing clusters by at least one ITI (~2–4 s).
     """
     diffs  = (ap_onsets[:, None] - wf_times[None, :]).ravel()
     lo, hi = diffs.min() - 1.0, diffs.max() + 1.0 + HIST_BIN_S
@@ -163,16 +129,10 @@ def _estimate_offset(wf_times: np.ndarray, ap_onsets: np.ndarray) -> float:
 def _nn_match(wf_ap: np.ndarray,
               ap_onsets: np.ndarray,
               max_tol: float) -> tuple[np.ndarray, np.ndarray]:
-    """
-    For each WF entry (already shifted to AP clock), find the nearest
-    unmatched AP onset within max_tol.
+    """nearest-neighbour match of WF entries (shifted to AP clock) to AP onsets.
 
-    Returns
-    -------
-    matched_ap_idx : int array, shape (n_wf,)
-        Index into ap_onsets for each WF entry; −1 if no match within tolerance.
-    residuals : float array, shape (n_wf,)
-        ap_onsets[match] − wf_ap  (positive = AP late); NaN where unmatched.
+    Returns matched_ap_idx (index into ap_onsets, -1 if unmatched) and
+    residuals (ap_onsets[match] − wf_ap, NaN where unmatched).
     """
     order = np.argsort(ap_onsets)
     ap_s  = ap_onsets[order]
@@ -202,7 +162,7 @@ def _nn_match(wf_ap: np.ndarray,
 def _write_stim_times(diag_dir: Path, block_label: str,
                       wf_times, wf_amps, offset, matched_mask,
                       ap_onsets, matched_ap_idx, spurious_ap_times, has_extrapolated):
-    """Write stim_times_{block}.csv for manual NIDQ inspection."""
+    """write stim_times_{block}.csv for manual NIDQ inspection."""
     ap_times_out = np.full(len(wf_times), np.nan)
     ap_times_out[matched_mask] = ap_onsets[matched_ap_idx[matched_mask]]
 

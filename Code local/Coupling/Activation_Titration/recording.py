@@ -1,9 +1,4 @@
-"""
-Recording class for loading and preprocessing Neuropixels data.
-
-This module provides a unified interface for loading spike sorting results,
-metadata, and probe geometry from a single Neuropixels recording session.
-"""
+"""recording class for loading and preprocessing neuropixels data."""
 
 import numbers
 import re
@@ -18,16 +13,7 @@ _RESET = "\033[0m"
 
 
 def resolve_session_paths(top_dir: Path) -> dict:
-    """
-    Derive all session file paths from a top-level SpikeGLX session directory.
-
-    Returns
-    -------
-    dict with keys:
-        recording_dir : Path  – imec0 subdirectory (kilosort output lives here)
-        nidq_file     : Path  – NIDQ binary file
-        waveform_csv  : Path  – WaveformSequence.csv
-    """
+    """derive all session file paths from a top-level SpikeGLX session directory."""
     top_dir = Path(top_dir)
     recording_dirs = list(top_dir.glob("*_imec0"))
     nidq_files = list(top_dir.glob("*.nidq.bin"))
@@ -45,25 +31,17 @@ def resolve_session_paths(top_dir: Path) -> dict:
     }
 
 
-# =============================================================================
-# CONSTANTS (from ibl-neuropixel)
-# =============================================================================
-
-# sample to volt conversion factors
-S2V_AP = 2.34375e-06
+S2V_AP  = 2.34375e-06
 S2V_LFP = 4.6875e-06
 
-# number of channels
 NC = 384
 
-# channel layouts for neuropixel probes as a function of the major version (1 or 2)
 CHANNEL_GRID = {
     1: dict(DX=16, X0=11, DY=20, Y0=20),
     2: dict(DX=32, X0=27, DY=15, Y0=20),
     "NPultra": dict(DX=6, X0=0, DY=6, Y0=0),
 }
 
-# major version mapping
 MAJOR_VERSION = {
     "3A": 1,
     "3B2": 1,
@@ -73,7 +51,6 @@ MAJOR_VERSION = {
     "NPultra": "NPultra",
 }
 
-# default config values
 DEFAULT_CONFIG = {
     "spike_processing": {
         "refractory_period_ms": 1.5,
@@ -87,13 +64,8 @@ DEFAULT_CONFIG = {
 }
 
 
-# =============================================================================
-# PROBE GEOMETRY FUNCTIONS (adapted from ibl-neuropixel)
-# =============================================================================
-
-
 def _xy2rc(x, y, version=1):
-    """Convert um coordinates to row/col indices."""
+    """convert um coordinates to row/col indices."""
     version = np.floor(version) if isinstance(version, numbers.Number) else version
     grid = CHANNEL_GRID[version]
     col = (x - grid["X0"]) / grid["DX"]
@@ -102,7 +74,7 @@ def _xy2rc(x, y, version=1):
 
 
 def _rc2xy(row, col, version=1):
-    """Convert row/col indices to um coordinates."""
+    """convert row/col indices to um coordinates."""
     version = np.floor(version) if isinstance(version, numbers.Number) else version
     grid = CHANNEL_GRID[version]
     x = col * grid["DX"] + grid["X0"]
@@ -111,7 +83,7 @@ def _rc2xy(row, col, version=1):
 
 
 def _dense_layout(version=1, nshank=1):
-    """Returns a dense layout indices map for neuropixel probes."""
+    """return dense channel layout for neuropixel probes."""
     ch = {
         "ind": np.arange(NC),
         "row": np.floor(np.arange(NC) / 2),
@@ -148,7 +120,7 @@ def _dense_layout(version=1, nshank=1):
 
 
 def _adc_shifts(version=1, nc=NC):
-    """Calculate ADC timing shifts for each channel."""
+    """calculate ADC timing shifts for each channel."""
     if version == 1 or version == "NPultra":
         adc_channels = 12
         n_cycles = 13
@@ -162,19 +134,14 @@ def _adc_shifts(version=1, nc=NC):
 
 
 def _trace_header(version=1, nshank=1):
-    """Returns default channel map for dense layouts."""
+    """return default channel map for dense layouts."""
     h = _dense_layout(version=version, nshank=nshank)
     h["sample_shift"], h["adc"] = _adc_shifts(version=version)
     return h
 
 
-# =============================================================================
-# METADATA PARSING FUNCTIONS (adapted from ibl-neuropixel)
-# =============================================================================
-
-
 def _get_neuropixel_version_from_meta(md: dict) -> str:
-    """Get neuropixel version tag from metadata dictionary."""
+    """get neuropixel version tag from metadata dictionary."""
     if "typeEnabled" in md.keys():
         return "3A"
     prb_type = md.get("imDatPrb_type")
@@ -193,7 +160,7 @@ def _get_neuropixel_version_from_meta(md: dict) -> str:
 
 
 def _get_neuropixel_major_version_from_meta(md: dict):
-    """Get major version number (1, 2, 2.4, or 'NPultra') from metadata."""
+    """get major version number (1, 2, 2.4, or 'NPultra') from metadata."""
     version = _get_neuropixel_version_from_meta(md)
     if version is not None:
         return MAJOR_VERSION.get(version)
@@ -201,7 +168,7 @@ def _get_neuropixel_major_version_from_meta(md: dict):
 
 
 def _map_channels_from_meta(meta_data: dict) -> dict:
-    """Extract channel positions from metadata string."""
+    """extract channel positions from metadata string."""
     if "snsShankMap" in meta_data.keys():
         chmap = re.findall(r"([0-9]*:[0-9]*:[0-9]*:[0-9]*)", meta_data["snsShankMap"])
         key_names = {"shank": 0, "col": 1, "row": 2, "flag": 3}
@@ -217,7 +184,7 @@ def _map_channels_from_meta(meta_data: dict) -> dict:
 
 
 def _split_geometry_into_shanks(th: dict, meta_data: dict) -> dict:
-    """Reduce geometry to specific shank for NP2.4 probes."""
+    """reduce geometry to specific shank for NP2.4 probes."""
     if "NP2.4_shank" in meta_data.keys():
         shank_idx = np.where(th["shank"] == int(meta_data["NP2.4_shank"]))[0]
         th = {key: th[key][shank_idx] for key in th.keys()}
@@ -225,7 +192,7 @@ def _split_geometry_into_shanks(th: dict, meta_data: dict) -> dict:
 
 
 def _geometry_from_meta(meta_data: dict, nc: int = 384) -> dict:
-    """Get probe geometry from metadata, with fallback to default layout."""
+    """get probe geometry from metadata, with fallback to default layout."""
     cm = _map_channels_from_meta(meta_data)
     major_version = _get_neuropixel_major_version_from_meta(meta_data)
 
@@ -261,47 +228,15 @@ def _geometry_from_meta(meta_data: dict, nc: int = 384) -> dict:
     return th
 
 
-# =============================================================================
-# RECORDING CLASS
-# =============================================================================
-
-
 class Recording:
-    """
-    Loads and preprocesses a single Neuropixels recording (one probe).
-
-    Parameters
-    ----------
-    recording_dir : Path or str
-        Path to the recording directory (e.g., `.../imec0/`)
-    config : dict
-        Configuration dictionary with keys:
-        - paths.input_dir, paths.output_dir
-        - spike_processing.refractory_period_ms, spike_processing.quality_filter
-        - files.ks_dir, files.user_meta, files.area_depths
-
-    Attributes
-    ----------
-    probe_num : int
-        Probe number extracted from folder name (imec0 → 0)
-    probeVersion : str
-        Neuropixel version string (e.g., '3B2', 'NP2.1')
-    probeGeometry : dict
-        Electrode positions with keys 'x', 'y', 'row', 'col', etc.
-    clusterInfo : pd.DataFrame
-        Cluster information with layer assignments
-    unitSpikes : dict
-        Mapping of cluster_id to spike times array
-    """
+    """loads spike sorting results and probe geometry for a single neuropixels recording."""
 
     def __init__(self, recording_dir: Path, config: dict):
         self.recording_dir = Path(recording_dir)
         self.config = self._validate_config(config)
 
-        # extract probe number from folder name
         self.probe_num: int = self._extract_probe_num()
 
-        # attributes populated during init
         self.paths: dict = {}
         self.LFmetaDict: dict = {}
         self.APmetaDict: dict = {}
@@ -314,7 +249,6 @@ class Recording:
         self.unitSpikes: Dict[int, np.ndarray] = {}
         self.areaDepths: dict = {}
 
-        # run init sequence
         self._get_paths()
         self._load_meta()
         self._load_probe_geometry()
@@ -324,18 +258,14 @@ class Recording:
         self._assign_layers()
 
     def __repr__(self) -> str:
-        """Return a summary of the Recording object."""
-        # count total spikes
         total_spikes = sum(len(s) for s in self.unitSpikes.values())
 
-        # layer distribution
         layer_counts = self.clusterInfo["layer"].value_counts().to_dict()
         layer_str = ", ".join(
             f"{k}: {v}" for k, v in sorted(layer_counts.items()) if k is not None
         )
         unassigned = self.clusterInfo["layer"].isna().sum()
 
-        # geometry info
         n_channels = len(self.probeGeometry.get("x", []))
 
         lines = [
@@ -366,10 +296,7 @@ class Recording:
         return "\n".join(lines)
 
     def _validate_config(self, config: dict) -> dict:
-        """Validate config and merge with defaults."""
         validated = {}
-
-        # merge optional sections with defaults
         validated["spike_processing"] = {
             **DEFAULT_CONFIG["spike_processing"],
             **config.get("spike_processing", {}),
@@ -378,11 +305,9 @@ class Recording:
             **DEFAULT_CONFIG["files"],
             **config.get("files", {}),
         }
-
         return validated
 
     def _extract_probe_num(self) -> int:
-        """Extract probe number from folder name (imec0 → 0, imec1 → 1)."""
         folder_name = self.recording_dir.name
         match = re.search(r"imec(\d+)$", folder_name)
         if not match:
@@ -393,7 +318,6 @@ class Recording:
         return int(match.group(1))
 
     def _get_paths(self) -> None:
-        """Locate all required files in the recording directory."""
         files_config = self.config["files"]
 
         self.paths = {
@@ -406,7 +330,6 @@ class Recording:
             "areaDepthsPath": self.recording_dir / files_config["area_depths"],
         }
 
-        # find meta files
         for f in self.recording_dir.iterdir():
             if f.is_file():
                 if f.name.endswith(".lf.meta"):
@@ -418,7 +341,6 @@ class Recording:
                 elif f.name.endswith(".lf.bin") or f.name.endswith(".lf.cbin"):
                     self.paths["rawLfBinPath"] = f
 
-        # validate required files
         if self.paths["apMetaPath"] is None:
             raise FileNotFoundError(
                 f"AP metadata file (.ap.meta) not found in {self.recording_dir}"
@@ -439,22 +361,16 @@ class Recording:
             )
 
     def _load_meta(self) -> None:
-        """Load AP, LF, and user metadata files."""
-        # parse AP metadata
         self.APmetaDict = self._parse_meta_file(self.paths["apMetaPath"])
 
-        # parse LF metadata if exists
         if self.paths["lfMetaPath"] is not None:
             self.LFmetaDict = self._parse_meta_file(self.paths["lfMetaPath"])
 
-        # get probe version
         self.probeVersion = _get_neuropixel_version_from_meta(self.APmetaDict)
-
-        # parse user metadata
         self._load_user_meta()
 
     def _parse_meta_file(self, path: Path) -> dict:
-        """Parse SpikeGLX meta file into dictionary."""
+        """parse SpikeGLX meta file into dictionary."""
         meta_dict = {}
         with path.open() as f:
             for line in f.read().splitlines():
@@ -466,7 +382,6 @@ class Recording:
                 key = key.strip()
                 value = value.strip()
 
-                # try to parse numeric values
                 if value and re.fullmatch(r"[0-9,.]*", value) and value.count(".") < 2:
                     parsed = [float(val) for val in value.split(",")]
                     value = parsed[0] if len(parsed) == 1 else parsed
@@ -475,7 +390,6 @@ class Recording:
         return meta_dict
 
     def _load_user_meta(self) -> None:
-        """Load user-created meta.txt file."""
         with self.paths["userMetaPath"].open() as f:
             for line in f:
                 line = line.strip()
@@ -504,7 +418,6 @@ class Recording:
             )
 
     def _load_probe_geometry(self) -> None:
-        """Load probe geometry from AP metadata."""
         self.probeGeometry = _geometry_from_meta(self.APmetaDict)
         if self.probeGeometry is None:
             raise ValueError(
@@ -513,10 +426,8 @@ class Recording:
             )
 
     def _load_ks_data(self) -> None:
-        """Load Kilosort spike sorting outputs."""
         ks_dir = self.paths["ksPath"]
 
-        # load cluster info
         cluster_info_file = ks_dir / "cluster_info.tsv"
         if not cluster_info_file.exists():
             raise FileNotFoundError(f"cluster_info.tsv not found in {ks_dir}")
@@ -538,7 +449,6 @@ class Recording:
 
         good_ids = set(self.clusterInfo["cluster_id"])
 
-        # load spike times
         spike_times_file = ks_dir / "spike_times.npy"
         if not spike_times_file.exists():
             raise FileNotFoundError(f"spike_times.npy not found in {ks_dir}")
@@ -554,18 +464,16 @@ class Recording:
             np.save(spike_times_sec_file, spike_times)
             print(f"{_TEAL}\t...Saved spike times in seconds to {spike_times_sec_file.name}{_RESET}")
 
-        # load spike clusters
         spike_clusters_file = ks_dir / "spike_clusters.npy"
         if not spike_clusters_file.exists():
             raise FileNotFoundError(f"spike_clusters.npy not found in {ks_dir}")
         spike_clusters = np.load(spike_clusters_file).flatten()
 
-        # discard spikes from excluded units
         keep_mask = np.isin(spike_clusters, list(good_ids))
         spike_clusters = spike_clusters[keep_mask]
         spike_times = spike_times[keep_mask]
 
-        # organize spikes by unit using optimized np.split
+        # organize spikes by unit using np.split (faster than dict loop)
         sort_idx = np.argsort(spike_clusters)
         sorted_clusters = spike_clusters[sort_idx]
         sorted_times = spike_times[sort_idx]
@@ -578,12 +486,10 @@ class Recording:
         )
 
     def _load_area_depths(self) -> None:
-        """Load layer boundary definitions from area_depths.csv."""
         path = self.paths["areaDepthsPath"]
         df = pd.read_csv(path)
         df.columns = df.columns.str.strip()
 
-        # find columns
         layer_col = next((c for c in df.columns if "layer" in c.lower()), None)
         start_col = next((c for c in df.columns if "start" in c.lower()), None)
         end_col = next((c for c in df.columns if "end" in c.lower()), None)
@@ -608,7 +514,6 @@ class Recording:
             self.areaDepths[layer_name] = (float(row[start_col]), float(row[end_col]))
 
     def _filter_refractory_violations(self) -> None:
-        """Remove spikes within refractory period."""
         refractory_ms = self.config["spike_processing"]["refractory_period_ms"]
         refractory_sec = refractory_ms * 1e-3
 
@@ -629,13 +534,11 @@ class Recording:
         )
 
     def _assign_layers(self) -> None:
-        """Assign neurons to layers based on brain depth."""
         surface_um = self.surfaceChan * 10  # 10µm spacing
         self.clusterInfo["brain_depth"] = surface_um - self.clusterInfo["depth"]
 
         self.clusterInfo["layer"] = None
 
-        # sort layers by start depth
         sorted_layers = sorted(self.areaDepths.items(), key=lambda x: x[1][0])
         print(f"{_TEAL}\t...Layer depth ranges: { {k: v for k, v in sorted_layers} }{_RESET}")
 
@@ -654,24 +557,8 @@ class Recording:
             self.paths["ksPath"] / "cluster_info.tsv", sep="\t", index=False
         )
 
-    # =========================================================================
-    # OPTIONAL METHODS (not called during init)
-    # =========================================================================
-
     def _get_raw_reader(self, band: str = "ap") -> np.memmap:
-        """
-        Memory-map raw binary data file.
-
-        Parameters
-        ----------
-        band : str
-            'ap' for action potential band, 'lf' for LFP band
-
-        Returns
-        -------
-        np.memmap
-            Memory-mapped array with shape (n_channels, n_samples)
-        """
+        """memory-map raw binary data file. band: 'ap' or 'lf'."""
         if band == "ap":
             path = self.paths["rawApBinPath"]
             meta = self.APmetaDict
@@ -700,20 +587,6 @@ class Recording:
         return data
 
     def _samples_to_volts(self, data: np.ndarray, band: str = "ap") -> np.ndarray:
-        """
-        Convert raw int16 samples to volts.
-
-        Parameters
-        ----------
-        data : np.ndarray
-            Raw int16 data
-        band : str
-            'ap' or 'lf' band
-
-        Returns
-        -------
-        np.ndarray
-            Data converted to volts (float32)
-        """
+        """convert raw int16 samples to volts."""
         s2v = S2V_AP if band == "ap" else S2V_LFP
         return data.astype(np.float32) * s2v

@@ -1,7 +1,6 @@
-"""
-Data stream alignment using sync pulses.
+"""data stream alignment using sync pulses.
 
-Aligns multi-device recordings (e.g., NIDQ + Neuropixels) by detecting shared
+aligns multi-device recordings (e.g., NIDQ + neuropixels) by detecting shared
 sync pulses and correcting for temporal drift between devices.
 """
 
@@ -24,15 +23,13 @@ except ImportError:
     HAS_TQDM = False
 
 
-
-
 _TEAL   = "\033[38;2;187;230;228m"
 _ORANGE = "\033[38;2;255;149;5m"
 _RESET  = "\033[0m"
 
 
 def read_meta(bin_path: Path) -> dict:
-    """Parse SGLX meta file into dictionary. Works for .bin and .cbin (replaces last suffix)."""
+    """parse SGLX meta file into dictionary. works for .bin and .cbin."""
     meta_path = Path(bin_path).with_suffix(".meta")
     meta_dict = {}
     with open(meta_path) as meta_file:
@@ -41,22 +38,15 @@ def read_meta(bin_path: Path) -> dict:
                 key, val = line.split("=", 1)
                 key = key.strip()
                 val = val.strip()
-                
-                # parse numeric values
                 if val and re.fullmatch(r"[0-9,.]*", val) and val.count(".") < 2:
                     parsed = [float(v) for v in val.split(",")]
                     val = parsed[0] if len(parsed) == 1 else parsed
-                
                 meta_dict[key] = val
     return meta_dict
 
 
 def read_channel_from_cbin(cbin_path: Path, channel_idx: int) -> np.ndarray:
-    """
-    Read a single channel from a .cbin file entirely in memory (no .bin written to disk).
-
-    Each chunk is decompressed, the requested channel is extracted, and the rest is discarded.
-    """
+    """read a single channel from a .cbin file without writing to disk."""
     if not HAS_MTSCOMP:
         raise ImportError("mtscomp required to read .cbin files.")
     r = mtscomp.Reader()
@@ -68,28 +58,21 @@ def read_channel_from_cbin(cbin_path: Path, channel_idx: int) -> np.ndarray:
     chunk_iter = list(r.iter_chunks())
     it = tqdm(chunk_iter, desc=f"  Reading {Path(cbin_path).name}", unit="chunk") if HAS_TQDM else chunk_iter
     for chunk_idx, chunk_start, chunk_length in it:
-        chunk = r.read_chunk(chunk_idx, chunk_start, chunk_length)  # (n_samples_chunk, n_channels)
+        chunk = r.read_chunk(chunk_idx, chunk_start, chunk_length)
         chunks.append(chunk[:, channel_idx].copy())
     r.close()
     return np.concatenate(chunks)
 
 
 def make_memmap(bin_path: Path, meta: dict) -> np.memmap:
-    """Memory-map binary data file."""
+    """memory-map binary data file."""
     n_chan = int(meta["nSavedChans"])
     n_samp = int(int(meta["fileSizeBytes"]) / (2 * n_chan))
-    
-    return np.memmap(
-        bin_path,
-        dtype=np.int16,
-        mode="r",
-        shape=(n_chan, n_samp),
-        order="F"
-    )
+    return np.memmap(bin_path, dtype=np.int16, mode="r", shape=(n_chan, n_samp), order="F")
 
 
 def unpack_bits(channel_data: np.ndarray) -> np.ndarray:
-    """Unpack all 16 bits from a 1D int16 channel array. Returns (16, n_samples) uint8."""
+    """unpack all 16 bits from a 1D int16 channel array. returns (16, n_samples) uint8."""
     dig = np.zeros((16, len(channel_data)), dtype=np.uint8)
     for bit in range(16):
         dig[bit, :] = (channel_data >> bit) & 0x01
@@ -97,7 +80,7 @@ def unpack_bits(channel_data: np.ndarray) -> np.ndarray:
 
 
 def extract_digital_channel(raw_data: np.memmap, channel_idx: int) -> np.ndarray:
-    """Extract and unpack a digital channel from a 2D memmap. Returns (16, n_samples) uint8."""
+    """extract and unpack a digital channel from a 2D memmap. returns (16, n_samples) uint8."""
     if channel_idx < 0:
         channel_idx = raw_data.shape[0] + channel_idx
     return unpack_bits(raw_data[channel_idx, :])
@@ -107,13 +90,7 @@ def merge_nearby_pulses(onset_samples: np.ndarray, offset_samples: np.ndarray,
                        sample_rate: float, max_gap_ms: float = 1.0,
                        target_duration_ms: float = 28.0,
                        tolerance_ms: float = 5.0) -> tuple:
-    """Merge clusters of pulses separated by short gaps if the cluster span matches target duration.
-
-    Groups all consecutive pulses with inter-pulse gaps <= max_gap_ms into a cluster.
-    If the cluster's total span (last offset - first onset) is within tolerance of
-    target_duration_ms, the entire cluster is replaced by a single pulse. This handles
-    noisy pulses that fragment into many short sub-pulses.
-    """
+    """merge clusters of pulses separated by short gaps if the cluster span matches target duration."""
     if len(onset_samples) == 0:
         return onset_samples, offset_samples
 
@@ -126,7 +103,6 @@ def merge_nearby_pulses(onset_samples: np.ndarray, offset_samples: np.ndarray,
 
     i = 0
     while i < len(onset_samples):
-        # greedily extend cluster while consecutive gap is small
         j = i
         cluster_end = offset_samples[i]
         while j + 1 < len(onset_samples):
@@ -138,14 +114,12 @@ def merge_nearby_pulses(onset_samples: np.ndarray, offset_samples: np.ndarray,
                 break
 
         if j > i:
-            # multi-pulse cluster: merge if span matches target duration
             span = cluster_end - onset_samples[i]
             if min_span <= span <= max_span:
                 merged_onsets.append(onset_samples[i])
                 merged_offsets.append(cluster_end)
                 i = j + 1
                 continue
-            # span doesn't match — keep individual pulses (they'll be filtered by duration)
             for k in range(i, j + 1):
                 merged_onsets.append(onset_samples[k])
                 merged_offsets.append(offset_samples[k])
@@ -162,9 +136,9 @@ def extract_pulses_with_duration(pulse_data: np.ndarray, sample_rate: float,
                                  target_duration_ms: float = None,
                                  tolerance_ms: float = 2.0,
                                  merge_gap_ms: float = 0.0) -> np.ndarray:
-    """Extract pulse onset times, optionally filtering by duration.
+    """extract pulse onset times, optionally filtering by duration.
 
-    If target_duration_ms is None, every rising edge is returned (no duration filter).
+    if target_duration_ms is None, every rising edge is returned.
     """
     data = pulse_data.astype(np.int8)
     diffs = np.diff(data, prepend=0, append=0)
@@ -177,7 +151,6 @@ def extract_pulses_with_duration(pulse_data: np.ndarray, sample_rate: float,
     if target_duration_ms is None:
         return onset_samples / sample_rate
 
-    # Merge nearby pulses if requested
     if merge_gap_ms > 0:
         onset_samples, offset_samples = merge_nearby_pulses(
             onset_samples, offset_samples, sample_rate,
@@ -204,32 +177,26 @@ def extract_pulses_with_duration(pulse_data: np.ndarray, sample_rate: float,
 
 
 class DataStreamAligner:
-    """
-    Align multi-device recordings using sync pulses.
-    
-    Corrects temporal drift between a reference stream (e.g., Neuropixels AP)
+    """align multi-device recordings using sync pulses.
+
+    corrects temporal drift between a reference stream (e.g., neuropixels AP)
     and target streams (e.g., NIDQ) using shared sync pulses.
     """
-    
+
     def __init__(self, reference_file: Path, reference_sync_channel: int,
                  sync_params: dict, reference_sync_bit: int = 0,
                  cache_dir: Optional[Path] = None):
         """
-        Initialize aligner with reference stream.
-
         Parameters
         ----------
         reference_file : Path
-            Path to reference .bin or .cbin file (e.g., .ap.bin)
+            path to reference .bin or .cbin file (e.g., .ap.bin)
         reference_sync_channel : int
-            Channel index for sync pulses (negative indexing supported)
+            channel index for sync pulses (negative indexing supported)
         sync_params : dict
-            Pulse extraction parameters:
-            - target_duration_ms: expected pulse duration
-            - tolerance_ms: duration tolerance
-            - merge_gap_ms: max gap for merging split pulses
+            pulse extraction parameters: target_duration_ms, tolerance_ms, merge_gap_ms
         reference_sync_bit : int
-            Bit number within sync channel (0-15). For AP files, use 6.
+            bit number within sync channel (0-15). for AP files, use 6.
         """
         self.reference_file = Path(reference_file)
         self.reference_sync_channel = reference_sync_channel
@@ -241,13 +208,11 @@ class DataStreamAligner:
         self.check_sync_ipi = sync_params.pop("check_sync_ipi", True)
         self.sync_params = sync_params
 
-        # Load reference metadata (.cbin has a .ap.meta sidecar with the same stem)
         self.reference_meta = read_meta(self.reference_file)
         assert self.reference_meta, f"Meta file not found for {self.reference_file}"
 
         self.reference_sample_rate = float(self.reference_meta["imSampRate"])
 
-        # Extract reference sync pulses — read only the sync channel, no .bin written to disk
         print(f"Extracting sync from reference: {self.reference_file.name}")
         cache_file = None
         if cache_dir is not None:
@@ -267,35 +232,27 @@ class DataStreamAligner:
             ch_idx = reference_sync_channel if reference_sync_channel >= 0 else ref_data.shape[0] + reference_sync_channel
             ref_channel = np.array(ref_data[ch_idx, :])
         ref_dig = unpack_bits(ref_channel)
-        self._ref_sync_line = ref_dig[reference_sync_bit]  # kept for truncation check
+        self._ref_sync_line = ref_dig[reference_sync_bit]
 
         print(f"  Using bit {reference_sync_bit} for sync")
         self.reference_sync_onsets = extract_pulses_with_duration(
             ref_dig[reference_sync_bit], self.reference_sample_rate, **self.sync_params
         )
-        
+
         print(f"{_TEAL}  Found {len(self.reference_sync_onsets)} sync pulses{_RESET}")
         if self.check_sync_ipi:
             self.reference_sync_onsets = self._check_ipi(self.reference_sync_onsets, "reference")
 
-        # Target streams storage
         self.target_streams: Dict[str, dict] = {}
-    
-    def _check_ipi(self, onsets: np.ndarray, stream_name: str) -> np.ndarray:
-        """
-        Check sync pulse inter-pulse intervals for irregularities.
 
-        Warns in red for short IPIs (possible spurious pulse).
-        Fills long IPI gaps with synthetic onsets and warns in orange.
-        Returns (possibly extended) onset array.
-        """
+    def _check_ipi(self, onsets: np.ndarray, stream_name: str) -> np.ndarray:
+        """check sync pulse inter-pulse intervals; warn on short IPIs, fill long gaps with synthetic pulses."""
         if len(onsets) < 2:
             return onsets
 
         ipis = np.diff(onsets)
         median_ipi = float(np.median(ipis))
 
-        # warn on short IPIs (< 50% of expected) — cannot auto-fix
         short_idx = np.where(ipis < 0.5 * median_ipi)[0]
         for i in short_idx:
             print(
@@ -304,7 +261,6 @@ class DataStreamAligner:
                 f"(expected ~{median_ipi*1000:.0f} ms) — possible spurious pulse !!!{_RESET}"
             )
 
-        # fill long IPIs (> 150% of expected) with synthetic pulses
         long_idx = np.where(ipis > 1.5 * median_ipi)[0]
         if len(long_idx) == 0:
             return onsets
@@ -328,38 +284,23 @@ class DataStreamAligner:
 
     def add_target_stream(self, target_file: Path, target_sync_channel: int,
                          stream_name: str, target_sync_bit: int = 0):
-        """
-        Add target stream to align.
-        
-        Parameters
-        ----------
-        target_file : Path
-            Path to target .bin or .cbin file
-        target_sync_channel : int
-            Channel index for sync pulses
-        stream_name : str
-            Identifier for this stream
-        target_sync_bit : int
-            Bit number within sync channel (0-15)
-        """
+        """add a target stream to align against the reference."""
         target_file = Path(target_file)
 
-        # Load target metadata
         target_meta = read_meta(target_file)
         assert target_meta, f"Meta file not found for {target_file}"
 
         target_sample_rate = float(target_meta.get("niSampRate", target_meta.get("imSampRate")))
 
-        # Extract target sync pulses
         print(f"\nExtracting sync from target '{stream_name}': {target_file.name}")
         if target_file.suffix == ".cbin":
             sync_channel_data = read_channel_from_cbin(target_file, target_sync_channel)
             target_dig = unpack_bits(sync_channel_data)
-            target_data = None  # cbin targets not supported for align_channel; load lazily if needed
+            target_data = None
         else:
             target_data = make_memmap(target_file, target_meta)
             target_dig = extract_digital_channel(target_data, target_sync_channel)
-        
+
         print(f"  Using bit {target_sync_bit} for sync")
         target_sync_onsets = extract_pulses_with_duration(
             target_dig[target_sync_bit], target_sample_rate, **self.sync_params
@@ -369,7 +310,6 @@ class DataStreamAligner:
         if self.check_sync_ipi:
             target_sync_onsets = self._check_ipi(target_sync_onsets, stream_name)
 
-        # Validate sync pulse counts match; trim trailing extra pulses if mismatch is small
         n_ref = len(self.reference_sync_onsets)
         n_tgt = len(target_sync_onsets)
         if n_ref != n_tgt:
@@ -382,9 +322,7 @@ class DataStreamAligner:
                 longer = "target" if n_tgt > n_ref else "reference"
                 n_keep = min(n_ref, n_tgt)
 
-                # Determine which end has the extra pulse by comparing first pulse times.
-                # If the first pulses are already aligned, the extra pulse is at the end.
-                # If they differ by ~one period, the extra pulse is at the beginning.
+                # determine which end has the extra pulse by comparing first pulse times
                 median_interval = float(np.median(np.diff(self.reference_sync_onsets)))
                 first_diff = abs(target_sync_onsets[0] - self.reference_sync_onsets[0])
                 trim_end = "end" if first_diff < 0.5 * median_interval else "beginning"
@@ -400,7 +338,6 @@ class DataStreamAligner:
                     else:
                         self.reference_sync_onsets = self.reference_sync_onsets[diff:]
 
-                # Check whether the sync line was high at the trimmed sample (confirms truncation)
                 if trim_end == "end":
                     if longer == "target":
                         edge_high = bool(target_dig[target_sync_bit, -1])
@@ -431,16 +368,14 @@ class DataStreamAligner:
                     f"  Difference: {diff} pulse(s) — too large to auto-trim (max_trim={self.max_trim})\n"
                     f"  Check for spurious pulses (short-IPI warnings above) or multiple missing pulses."
                 )
-        
-        # Calculate drift
+
         drift = self.reference_sync_onsets - target_sync_onsets
         max_drift = np.max(np.abs(drift))
-        
+
         print(f"{_TEAL}  Max drift: {max_drift*1000:.2f} ms{_RESET}")
-        if max_drift > 0.1:  # 100ms
+        if max_drift > 0.1:
             print(f"{_ORANGE}  WARNING: Drift exceeds 100ms threshold!{_RESET}")
-        
-        # Store stream info
+
         self.target_streams[stream_name] = {
             "file": target_file,
             "meta": target_meta,
@@ -448,103 +383,56 @@ class DataStreamAligner:
             "sync_onsets": target_sync_onsets,
             "data": target_data,
         }
-    
+
     def _correct_times(self, target_times: np.ndarray, stream_name: str) -> np.ndarray:
-        """
-        Apply nearest-sync correction to event times.
-        
-        Uses vectorized nearest-neighbor lookup for speed.
-        """
+        """apply nearest-sync correction to event times (vectorized)."""
         stream = self.target_streams[stream_name]
         target_sync = stream["sync_onsets"]
-        
-        # Find nearest sync pulse for each event (vectorized)
+
         indices = np.searchsorted(target_sync, target_times)
         indices = np.clip(indices, 0, len(target_sync) - 1)
-        
-        # Calculate shifts
+
         shifts = self.reference_sync_onsets[indices] - target_sync[indices]
-        
-        # Apply correction
         return target_times + shifts
-    
+
     def align_channel(self, stream_name: str, channel_number: int,
                      pulse_params: dict, output_dir: Optional[Path] = None) -> np.ndarray:
-        """
-        Extract and align events from a channel.
-        
-        Parameters
-        ----------
-        stream_name : str
-            Target stream identifier
-        channel_number : int
-            Channel to extract events from
-        pulse_params : dict
-            Pulse extraction parameters (duration, tolerance, merge_gap)
-        output_dir : Path, optional
-            Directory to save aligned times
-        
-        Returns
-        -------
-        np.ndarray
-            Aligned event times (in reference time)
-        """
+        """extract events from a channel and return them in reference time."""
         assert stream_name in self.target_streams, f"Stream '{stream_name}' not found"
-        
+
         stream = self.target_streams[stream_name]
-        
+
         print(f"\nAligning channel {channel_number} from '{stream_name}'...")
-        
-        # Extract digital channel (SpikeGLX convention: digital/sync words always in last channel)
+
+        # SpikeGLX convention: digital/sync words always in last channel
         dig_array = extract_digital_channel(stream["data"], -1)
-        
-        # Extract events from specified bit within the digital word
+
         event_onsets = extract_pulses_with_duration(
             dig_array[channel_number], stream["sample_rate"], **pulse_params
         )
-        
+
         print(f"{_TEAL}  Extracted {len(event_onsets)} events{_RESET}")
-        
-        # Correct times
+
         aligned_onsets = self._correct_times(event_onsets, stream_name)
-        
-        # Save if output_dir provided
+
         if output_dir:
             output_dir = Path(output_dir)
             output_dir.mkdir(exist_ok=True)
             output_file = output_dir / f"{stream_name}_ch{channel_number}_aligned.txt"
             np.savetxt(output_file, aligned_onsets, fmt="%.6f")
             print(f"  Saved to {output_file}")
-        
+
         return aligned_onsets
-    
+
     def align_channels(self, stream_name: str, channels: List[int],
                       pulse_params_list: List[dict],
                       output_dir: Optional[Path] = None) -> Dict[int, np.ndarray]:
-        """
-        Extract and align multiple channels (batch processing).
-        
-        Parameters
-        ----------
-        stream_name : str
-            Target stream identifier
-        channels : list of int
-            Channel numbers to extract
-        pulse_params_list : list of dict
-            Pulse parameters for each channel
-        output_dir : Path, optional
-            Directory to save aligned times
-        
-        Returns
-        -------
-        dict
-            {channel_number: aligned_times}
-        """
+        """extract and align multiple channels."""
         assert len(channels) == len(pulse_params_list), \
             "channels and pulse_params_list must have same length"
-        
+
         results = {}
         for ch, params in zip(channels, pulse_params_list):
             results[ch] = self.align_channel(stream_name, ch, params, output_dir)
-        
+
         return results

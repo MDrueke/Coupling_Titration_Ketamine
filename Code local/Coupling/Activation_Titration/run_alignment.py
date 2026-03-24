@@ -1,9 +1,7 @@
-"""
-Pulse registration pipeline: align NIDQ stimulus channel to AP timebase, split
+"""pulse registration pipeline: align NIDQ stimulus channel to AP timebase, split
 into brain-state blocks, assign amplitudes from WaveformSequence files.
 
-Output: stim_amplitudes.csv with columns  onset_time_s | amplitude_v | brain_state
-This file is the only pulse-related input needed by activation_titration.py.
+output: stim_amplitudes.csv with columns  onset_time_s | amplitude_v | brain_state
 """
 
 from pathlib import Path
@@ -31,7 +29,7 @@ SYNC_PARAMS = {
     "merge_gap_ms": 3.0,  # merge noise fragments within a single sync pulse
     "max_trim": 1,
 }
-SYNC_BIT_AP = 6  # bit #6 of last channel in AP
+SYNC_BIT_AP = 6    # bit #6 of last channel in AP
 SYNC_BIT_NIDQ = 0  # bit 0 (line 0) in NIDQ
 
 STIM_PARAMS = {
@@ -94,7 +92,7 @@ def run_alignment(session_dir: Path, config: dict):
 
     print(f"{_TEAL}\n  Aligned {len(aligned_stim)} pulses{_RESET}")
 
-    # --- 2. Split at largest ITI gap (awake → ketamine transition) ---
+    # --- 2. split at largest ITI gap (awake → ketamine transition) ---
     split_at = int(np.argmax(np.diff(aligned_stim))) + 1
     awake_pulses = aligned_stim[:split_at]
     keta_pulses = aligned_stim[split_at:]
@@ -104,7 +102,7 @@ def run_alignment(session_dir: Path, config: dict):
 
     min_amp = config.get("alignment", {}).get("min_amplitude_v", None)
 
-    # --- 3. Amplitude matching ---
+    # --- 3. amplitude matching ---
     print("\n  [awake]")
     awake_matched = match_amplitudes(
         awake_pulses,
@@ -122,10 +120,10 @@ def run_alignment(session_dir: Path, config: dict):
         diag_dir=output_dir,
     )
 
-    # --- 4. Residual diagnostic plot ---
+    # --- 4. residual diagnostic plot ---
     plot_match_residuals(output_dir)
 
-    # --- 5. Combine and save ---
+    # --- 5. combine and save ---
     awake_matched["brain_state"] = "awake"
     keta_matched["brain_state"] = "ketamine"
     stim_df = pd.concat([awake_matched, keta_matched], ignore_index=True)
@@ -141,18 +139,10 @@ def run_alignment(session_dir: Path, config: dict):
 
 
 def plot_match_residuals(output_dir: Path):
-    """
-    Two-panel residual diagnostic for the amplitude matching.
+    """two-panel residual diagnostic for amplitude matching.
 
-    For each matched pair: residual = NIDQ_detection_time − (WF_time + offset).
-    A correct matching shows residuals clustered near 0 (ms range) with at most
-    a slow linear drift (clock rate mismatch between Matlab and SpikeGLX).
-
-    Red flags:
-      - Step jump by ~ITI (~3–4 s): matching shifted by one position, all
-        subsequent amplitude assignments are wrong.
-      - Bimodal histogram: some fraction of matches is systematically off.
-      - Growing divergence: uncorrected clock drift exceeding the 1 s tolerance.
+    red flags: step jump by ~ITI (matching shifted by one position, all subsequent
+    amplitude assignments wrong); bimodal histogram; growing divergence (clock drift).
     """
     nature_style = {
         "axes.edgecolor": "black",
@@ -193,7 +183,6 @@ def plot_match_residuals(output_dir: Path):
             r_ms = matched["residual_s"].values * 1e3
             t = matched["actual_ap_s"].values
 
-            # linear drift fit
             slope, intercept = np.polyfit(t, r_ms, 1)
             trend = slope * t + intercept
 
@@ -202,11 +191,7 @@ def plot_match_residuals(output_dir: Path):
 
             ax_ts.scatter(t, r_ms, s=16, color=color, alpha=0.7, linewidths=0)
             ax_ts.plot(
-                t,
-                trend,
-                color="black",
-                linewidth=1.2,
-                linestyle="--",
+                t, trend, color="black", linewidth=1.2, linestyle="--",
                 label=f"drift {slope * 1e3:.3f} µs/s",
             )
             ax_ts.axhline(0, color="black", linewidth=0.8, linestyle=":")
