@@ -637,9 +637,11 @@ class Recording:
 
         # sort layers by start depth
         sorted_layers = sorted(self.areaDepths.items(), key=lambda x: x[1][0])
+        print(f"{_TEAL}\t...Layer depth ranges: { {k: v for k, v in sorted_layers} }{_RESET}")
 
         for layer_name, (start_depth, end_depth) in sorted_layers:
-            mask = (self.clusterInfo["brain_depth"] >= start_depth) & (
+            unassigned = self.clusterInfo["layer"].isna()
+            mask = unassigned & (self.clusterInfo["brain_depth"] >= start_depth) & (
                 self.clusterInfo["brain_depth"] < end_depth
             )
             self.clusterInfo.loc[mask, "layer"] = layer_name
