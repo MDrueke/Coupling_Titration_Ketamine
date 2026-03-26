@@ -13,7 +13,7 @@ SESSIONS_TOML = Path("sessions.toml")
 OUTPUT_DIR_NAME = "output"
 
 WINDOW_MS = (-10.0, 20.0)  # (pre, post) ms relative to onset
-STIM_AMPLITUDE_RANGE = (2.0, None)  # (min_V, max_V) inclusive; None = no limit
+STIM_AMPLITUDE_RANGE = (0.5, 2)  # (min_V, max_V) inclusive; None = no limit
 SMOOTH_SIGMA = None  # gaussian smoothing (channels × samples)
 CLIM_PERCENTILE = 80  # percentile for symmetric colour limits
 DEPTH_RANGE_UM = (
@@ -209,12 +209,28 @@ def plot_sta(
     )
 
     im = _plot_heatmap_panel(
-        axes[0], awake_snap, channels, surface_channel, window_ms, srate, vmin, vmax, "Awake",
+        axes[0],
+        awake_snap,
+        channels,
+        surface_channel,
+        window_ms,
+        srate,
+        vmin,
+        vmax,
+        "Awake",
     )
     _plot_traces_panel(axes[1], awake_snap, window_ms, trace_attenuation)
 
     _plot_heatmap_panel(
-        axes[2], keta_snap, channels, surface_channel, window_ms, srate, vmin, vmax, "Ketamine",
+        axes[2],
+        keta_snap,
+        channels,
+        surface_channel,
+        window_ms,
+        srate,
+        vmin,
+        vmax,
+        "Ketamine",
     )
     _plot_traces_panel(axes[3], keta_snap, window_ms, trace_attenuation)
 
@@ -223,8 +239,12 @@ def plot_sta(
     axes[2].set_yticks([])
 
     fig.suptitle(session_name, fontsize=14)
-    plt.savefig(save_path.with_suffix(".pdf"), dpi=300, bbox_inches="tight", transparent=True)
-    plt.savefig(save_path.with_suffix(".png"), dpi=300, bbox_inches="tight", transparent=True)
+    plt.savefig(
+        save_path.with_suffix(".pdf"), dpi=300, bbox_inches="tight", transparent=True
+    )
+    plt.savefig(
+        save_path.with_suffix(".png"), dpi=300, bbox_inches="tight", transparent=True
+    )
     plt.close()
 
 
@@ -283,7 +303,9 @@ def process_session(session_dir: Path):
     keta_onsets = stim_df[stim_df["brain_state"] == "ketamine"]["onset_time_s"].values
 
     if len(awake_onsets) == 0 or len(keta_onsets) == 0:
-        print(f"  [SKIP] Insufficient trials after amplitude filter in {session_dir.name}")
+        print(
+            f"  [SKIP] Insufficient trials after amplitude filter in {session_dir.name}"
+        )
         return
 
     raw = _make_memmap(bin_path, meta)
@@ -294,17 +316,37 @@ def process_session(session_dir: Path):
     print(f"  Awake: {len(awake_samples)} trials | Keta: {len(keta_samples)} trials")
 
     awake_snap, n_awake = extract_voltage_snapshot(
-        raw, awake_samples, channels, WINDOW_MS, srate, fI2V, gains, smooth_sigma=SMOOTH_SIGMA,
+        raw,
+        awake_samples,
+        channels,
+        WINDOW_MS,
+        srate,
+        fI2V,
+        gains,
+        smooth_sigma=SMOOTH_SIGMA,
     )
     keta_snap, n_keta = extract_voltage_snapshot(
-        raw, keta_samples, channels, WINDOW_MS, srate, fI2V, gains, smooth_sigma=SMOOTH_SIGMA,
+        raw,
+        keta_samples,
+        channels,
+        WINDOW_MS,
+        srate,
+        fI2V,
+        gains,
+        smooth_sigma=SMOOTH_SIGMA,
     )
     print(f"  Averaged {n_awake} awake / {n_keta} keta trials")
 
     save_path = output_dir / "raw_sta"
     plot_sta(
-        awake_snap, keta_snap, channels, surface_channel, WINDOW_MS, srate,
-        session_dir.name, save_path,
+        awake_snap,
+        keta_snap,
+        channels,
+        surface_channel,
+        WINDOW_MS,
+        srate,
+        session_dir.name,
+        save_path,
     )
     print(f"  Saved → {save_path}.pdf/.png")
 
