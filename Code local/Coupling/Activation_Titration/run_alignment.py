@@ -12,8 +12,8 @@ import pandas as pd
 import tomllib
 
 from align_datastreams import DataStreamAligner
-from match_amplitudes import match_amplitudes
-from recording import resolve_session_paths
+from match_amplitudes import match_amplitudes, match_amplitudes_sequential
+from recording import _canonical_state, resolve_session_paths
 
 RECOMPUTE = False  # set True to redo everything even if stim_amplitudes.csv exists
 
@@ -29,7 +29,7 @@ SYNC_PARAMS = {
     "merge_gap_ms": 3.0,  # merge noise fragments within a single sync pulse
     "max_trim": 1,
 }
-SYNC_BIT_AP = 6    # bit #6 of last channel in AP
+SYNC_BIT_AP = 6  # bit #6 of last channel in AP
 SYNC_BIT_NIDQ = 0  # bit 0 (line 0) in NIDQ
 
 STIM_PARAMS = {
@@ -39,14 +39,35 @@ STIM_PARAMS = {
 }
 
 
+def _detect_anesthetic(session_dir: Path) -> str:
+    """read the top-level meta.txt and return the canonical anesthetic state name."""
+    meta_path = Path(session_dir) / "meta.txt"
+    if not meta_path.exists():
+        return "ketamine"
+    for line in meta_path.read_text().splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        canonical = _canonical_state(parts[0])
+        if canonical is not None and canonical != "awake":
+            return canonical
+    return "ketamine"
+
+
 def run_alignment(session_dir: Path, config: dict):
     paths = resolve_session_paths(session_dir)
     recording_dir = paths["recording_dir"]
     nidq_file = paths["nidq_file"]
     wf_csv_awake = paths["waveform_csv_awake"]
-    wf_csv_keta = paths["waveform_csv_keta"]
+    wf_csv_anesthesia = paths["waveform_csv_anesthesia"]
+    if wf_csv_anesthesia is None:
+        raise FileNotFoundError(
+            f"No anesthesia WaveformSequence CSV found in {session_dir}"
+        )
     output_dir = recording_dir / config["files"]["output_dir"]
     output_dir.mkdir(exist_ok=True)
+
+    anesthetic = _detect_anesthetic(session_dir)
 
     stim_file = output_dir / "stim_amplitudes.csv"
     if stim_file.exists() and not RECOMPUTE:
@@ -66,7 +87,7 @@ def run_alignment(session_dir: Path, config: dict):
         raise FileNotFoundError(f"AP file not found in {recording_dir}")
 
     print("=" * 70)
-    print(f"PULSE REGISTRATION: {session_dir.name}")
+    print(f"PULSE REGISTRATION: {session_dir.name}  [{anesthetic}]")
     print("=" * 70)
 
     aligner = DataStreamAligner(
@@ -92,45 +113,56 @@ def run_alignment(session_dir: Path, config: dict):
 
     print(f"{_TEAL}\n  Aligned {len(aligned_stim)} pulses{_RESET}")
 
-    # --- 2. split at largest ITI gap (awake → ketamine transition) ---
+    # --- 2. split at largest ITI gap (awake → anesthesia transition) ---
     split_at = int(np.argmax(np.diff(aligned_stim))) + 1
     awake_pulses = aligned_stim[:split_at]
-    keta_pulses = aligned_stim[split_at:]
+    anesthesia_pulses = aligned_stim[split_at:]
     print(
-        f"{_TEAL}  Block split: {len(awake_pulses)} awake | {len(keta_pulses)} keta{_RESET}"
+        f"{_TEAL}  Block split: {len(awake_pulses)} awake | {len(anesthesia_pulses)} {anesthetic}{_RESET}"
     )
 
     min_amp = config.get("alignment", {}).get("min_amplitude_v", None)
 
     # --- 3. amplitude matching ---
+    # ketamine recordings: use histogram offset estimator + NN matching (handles missed pulses)
+    # other anesthetics: sequential 1-to-1 matching (all pulses registered)
     print("\n  [awake]")
-    awake_matched = match_amplitudes(
-        awake_pulses,
-        str(wf_csv_awake),
-        "awake",
-        min_amplitude_v=min_amp,
-        diag_dir=output_dir,
-    )
-    print("  [ketamine]")
-    keta_matched = match_amplitudes(
-        keta_pulses,
-        str(wf_csv_keta),
-        "keta",
-        min_amplitude_v=min_amp,
-        diag_dir=output_dir,
-    )
+    if anesthetic == "ketamine":
+        awake_matched = match_amplitudes(
+            awake_pulses,
+            str(wf_csv_awake),
+            "awake",
+            min_amplitude_v=min_amp,
+            diag_dir=output_dir,
+        )
+        print(f"  [{anesthetic}]")
+        anesthesia_matched = match_amplitudes(
+            anesthesia_pulses,
+            str(wf_csv_anesthesia),
+            anesthetic,
+            min_amplitude_v=min_amp,
+            diag_dir=output_dir,
+        )
+        plot_match_residuals(output_dir)
+    else:
+        awake_matched = match_amplitudes_sequential(
+            awake_pulses, str(wf_csv_awake), "awake"
+        )
+        print(f"  [{anesthetic}]")
+        anesthesia_matched = match_amplitudes_sequential(
+            anesthesia_pulses, str(wf_csv_anesthesia), anesthetic
+        )
 
-    # --- 4. residual diagnostic plot ---
-    plot_match_residuals(output_dir)
-
-    # --- 5. combine and save ---
+    # --- 4. combine and save ---
     awake_matched["brain_state"] = "awake"
-    keta_matched["brain_state"] = "ketamine"
-    stim_df = pd.concat([awake_matched, keta_matched], ignore_index=True)
+    anesthesia_matched["brain_state"] = anesthetic
+    stim_df = pd.concat([awake_matched, anesthesia_matched], ignore_index=True)
     stim_df.to_csv(stim_file, index=False)
 
     print(f"\nPULSE REGISTRATION COMPLETE")
-    print(f"  {len(awake_matched)} awake pulses | {len(keta_matched)} ketamine pulses")
+    print(
+        f"  {len(awake_matched)} awake pulses | {len(anesthesia_matched)} {anesthetic} pulses"
+    )
     print(
         f"  Amplitude range: {stim_df['amplitude_v'].min():.4f} – "
         f"{stim_df['amplitude_v'].max():.4f} V"
@@ -191,7 +223,11 @@ def plot_match_residuals(output_dir: Path):
 
             ax_ts.scatter(t, r_ms, s=16, color=color, alpha=0.7, linewidths=0)
             ax_ts.plot(
-                t, trend, color="black", linewidth=1.2, linestyle="--",
+                t,
+                trend,
+                color="black",
+                linewidth=1.2,
+                linestyle="--",
                 label=f"drift {slope * 1e3:.3f} µs/s",
             )
             ax_ts.axhline(0, color="black", linewidth=0.8, linestyle=":")

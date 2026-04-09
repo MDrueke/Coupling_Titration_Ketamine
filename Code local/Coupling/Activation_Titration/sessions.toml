@@ -1,10 +1,21 @@
 [sessions]
 dirs = [
     # "/mnt/DATA/Coupling/2026_01_21_027667_calibrationtest_g0",
-    "/mnt/DATA/Coupling/2026_02_24_Calibration1_g0",
-    "/mnt/DATA/Coupling/2026_02_24_Calibration2_g0",
-    "/mnt/DATA/Coupling/2026_02_25_Calibration1_g0",
-    "/mnt/DATA/Coupling/2026_02_25_Calibration2_g0",
-    "/mnt/DATA/Coupling/2026_02_26_Calibration1_g0",
-    "/mnt/DATA/Coupling/2026_02_26_Calibration2_g0"
+    # Ketamine
+    #"/mnt/DATA/Coupling/2026_02_24_Calibration1_g0",
+    #"/mnt/DATA/Coupling/2026_02_24_Calibration2_g0",
+    #"/mnt/DATA/Coupling/2026_02_25_Calibration1_g0",
+    #"/mnt/DATA/Coupling/2026_02_25_Calibration2_g0",
+    #"/mnt/DATA/Coupling/2026_02_26_Calibration1_g0",
+    #"/mnt/DATA/Coupling/2026_02_26_Calibration2_g0"
+    # Isoflurane
+    "/mnt/DATA/Coupling/2026_04_03_CouplingIso1_g0/",
+    "/mnt/DATA/Coupling/2026_04_03_CouplingIso_1_g0/",
+    "/mnt/DATA/Coupling/2026_04_04_CouplingIso_1_g0/",
+    "/mnt/DATA/Coupling/2026_04_04_CouplingIso_3_g0/",
+    "/mnt/DATA/Coupling/2026_04_05_CouplingIso_1_g0/",
+    "/mnt/DATA/Coupling/2026_04_05_CouplingIso_3_g0/",
+    # Urethane
+    # "/mnt/DATA/Coupling/2026_04_06_CouplingUre_1_g0/",
+    # "/mnt/DATA/Coupling/2026_04_06_CouplingUre_3_g0/"
 ]

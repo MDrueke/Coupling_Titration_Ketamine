@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/DATA/Coupling/2026_04_03_CouplingIso1_g0/**)"
+    ]
+  }
+}

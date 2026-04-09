@@ -12,6 +12,20 @@ _TEAL  = "\033[38;2;187;230;228m"
 _RESET = "\033[0m"
 
 
+def _canonical_state(key: str):
+    """map a meta.txt state key (case-insensitive) to its canonical name, or None."""
+    k = key.lower()
+    if k == "awake":
+        return "awake"
+    if k.startswith("keta"):
+        return "ketamine"
+    if k.startswith("iso"):
+        return "isoflurane"
+    if k.startswith("ure"):
+        return "urethane"
+    return None
+
+
 def resolve_session_paths(top_dir: Path) -> dict:
     """derive all session file paths from a top-level SpikeGLX session directory."""
     top_dir = Path(top_dir)
@@ -23,11 +37,17 @@ def resolve_session_paths(top_dir: Path) -> dict:
     if not nidq_files:
         raise FileNotFoundError(f"No *.nidq.bin file found in {top_dir}")
 
+    # discover anesthesia WaveformSequence (any WF csv that isn't the awake one)
+    wf_anesthesia = [
+        f for f in top_dir.glob("WaveformSequence_*.csv")
+        if "awake" not in f.name.lower()
+    ]
+
     return {
         "recording_dir": recording_dirs[0],
         "nidq_file": nidq_files[0],
         "waveform_csv_awake": top_dir / "WaveformSequence_awake.csv",
-        "waveform_csv_keta": top_dir / "WaveformSequence_keta.csv",
+        "waveform_csv_anesthesia": wf_anesthesia[0] if wf_anesthesia else None,
     }
 
 
@@ -403,13 +423,14 @@ class Recording:
                     self.surfaceChan = int(value)
                 elif key == "region":
                     self.region = value
-                elif key in ("awake", "ketamine", "keta"):
-                    # expect: <key> <start> - <end>  (times in minutes; "end" → np.inf)
-                    time_parts = [p for p in parts[1:] if p != "-"]
-                    start = float(time_parts[0])
-                    end = np.inf if time_parts[1] == "end" else float(time_parts[1])
-                    canonical = "ketamine" if key == "keta" else key
-                    self.stateTimes[canonical] = (start, end)
+                else:
+                    canonical = _canonical_state(key)
+                    if canonical is not None:
+                        # expect: <key> <start> - <end>  (times in minutes; "end" → np.inf)
+                        time_parts = [p for p in parts[1:] if p != "-"]
+                        start = float(time_parts[0])
+                        end = np.inf if len(time_parts) < 2 or time_parts[1] == "end" else float(time_parts[1])
+                        self.stateTimes[canonical] = (start, end)
 
         if self.surfaceChan is None:
             raise ValueError(

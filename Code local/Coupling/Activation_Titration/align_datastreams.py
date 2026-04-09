@@ -139,6 +139,12 @@ def extract_pulses_with_duration(pulse_data: np.ndarray, sample_rate: float,
     """extract pulse onset times, optionally filtering by duration.
 
     if target_duration_ms is None, every rising edge is returned.
+
+    when target_duration_ms is set, uses best-fit matching: for each rising
+    edge, finds the unclaimed falling edge within [target±tolerance] ms that
+    is closest to target_duration_ms. greedy (chronological), so each falling
+    edge is used at most once. robust to glitch fragments within a pulse.
+    merge_gap_ms is retained for API compatibility but not used.
     """
     data = pulse_data.astype(np.int8)
     diffs = np.diff(data, prepend=0, append=0)
@@ -146,34 +152,39 @@ def extract_pulses_with_duration(pulse_data: np.ndarray, sample_rate: float,
     onset_samples = np.where(diffs == 1)[0]
     offset_samples = np.where(diffs == -1)[0]
 
-    assert len(onset_samples) == len(offset_samples), "Onset/offset mismatch"
-
     if target_duration_ms is None:
         return onset_samples / sample_rate
 
-    if merge_gap_ms > 0:
-        onset_samples, offset_samples = merge_nearby_pulses(
-            onset_samples, offset_samples, sample_rate,
-            max_gap_ms=merge_gap_ms,
-            target_duration_ms=target_duration_ms,
-            tolerance_ms=tolerance_ms
-        )
+    target_samples = target_duration_ms / 1000.0 * sample_rate
+    tol_samples    = tolerance_ms      / 1000.0 * sample_rate
+    lo_samples     = target_samples - tol_samples
+    hi_samples     = target_samples + tol_samples
 
-    durations_ms = (offset_samples - onset_samples) / sample_rate * 1000
-    min_dur = target_duration_ms - tolerance_ms
-    max_dur = target_duration_ms + tolerance_ms
-    mask = (durations_ms >= min_dur) & (durations_ms <= max_dur)
+    claimed = np.zeros(len(offset_samples), dtype=bool)
+    matched_onsets = []
+    n_unmatched = 0
 
-    n_rejected = int((~mask).sum())
-    if n_rejected > 0:
-        rejected_times = onset_samples[~mask] / sample_rate
-        rejected_durs = durations_ms[~mask]
-        print(f"{_TEAL}  Duration filter: rejected {n_rejected} pulse(s) outside "
-              f"{min_dur:.1f}–{max_dur:.1f} ms window:{_RESET}")
-        for t, d in zip(rejected_times, rejected_durs):
-            print(f"{_TEAL}    t={t:.3f} s  dur={d:.2f} ms{_RESET}")
+    for on in onset_samples:
+        lo_off = on + lo_samples
+        hi_off = on + hi_samples
+        # candidates: unclaimed falling edges within the tolerance window
+        cand_idx = np.where(
+            (~claimed) & (offset_samples >= lo_off) & (offset_samples <= hi_off)
+        )[0]
+        if len(cand_idx) == 0:
+            n_unmatched += 1
+            continue
+        # pick the candidate whose duration is closest to target
+        durs = offset_samples[cand_idx] - on
+        best = cand_idx[int(np.argmin(np.abs(durs - target_samples)))]
+        claimed[best] = True
+        matched_onsets.append(on)
 
-    return onset_samples[mask] / sample_rate
+    if n_unmatched > 0:
+        print(f"{_TEAL}  Pulse extraction: {n_unmatched} rising edge(s) had no matching "
+              f"offset within {target_duration_ms:.1f}±{tolerance_ms:.1f} ms — likely glitch fragments{_RESET}")
+
+    return np.array(matched_onsets, dtype=float) / sample_rate
 
 
 class DataStreamAligner:

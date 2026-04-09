@@ -16,6 +16,32 @@ QC_MAX_MEAN_ABS_S = 0.030  # error if |mean residual| exceeds this — catches b
 QC_MAX_MISS_FRAC  = 0.15   # warning if fraction of unmatched WF entries exceeds this
 
 
+def match_amplitudes_sequential(ap_onsets: np.ndarray,
+                                waveform_csv: str,
+                                block_label: str) -> pd.DataFrame:
+    """1-to-1 sequential matching: NIDQ pulse[k] ↔ WF amplitude[k] by index order.
+
+    Requires exactly as many AP detections as WF entries. No offset estimator needed;
+    call only after NIDQ pulses have already been aligned to AP timebase.
+    Returns one row per pulse with columns: onset_time_s, amplitude_v.
+    """
+    df_wf = pd.read_csv(waveform_csv)
+    amps_all = df_wf["Amplitude(V)"].values
+
+    n_wf = len(amps_all)
+    n_ap = len(ap_onsets)
+
+    if n_wf != n_ap:
+        raise ValueError(
+            f"[{block_label}] Sequential matching requires equal counts.\n"
+            f"  WF entries: {n_wf}, NIDQ detections: {n_ap}\n"
+            f"  Check pulse detection or WaveformSequence file."
+        )
+
+    print(f"{_TEAL}  Sequential match [{block_label}]: {n_ap} pulses ↔ {n_wf} WF entries{_RESET}")
+    return pd.DataFrame({"onset_time_s": ap_onsets, "amplitude_v": amps_all})
+
+
 def match_amplitudes(ap_onsets: np.ndarray,
                      waveform_csv: str,
                      block_label: str,
