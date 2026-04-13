@@ -73,7 +73,7 @@ MAJOR_VERSION = {
 
 DEFAULT_CONFIG = {
     "spike_processing": {
-        "refractory_period_ms": 1.5,
+        "refractory_period_ms": 1.0,
         "quality_filter": "good",
     },
     "files": {
