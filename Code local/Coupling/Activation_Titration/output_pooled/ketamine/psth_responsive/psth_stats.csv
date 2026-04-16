@@ -1,0 +1,2 @@
+bin_start,bin_end,statistic,p_value,n,significant,n_neurons
+5.0,35.0,3123.5,0.37234125014084085,124,False,124

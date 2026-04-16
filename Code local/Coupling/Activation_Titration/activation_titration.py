@@ -4,10 +4,15 @@ processes each session for two brain states (awake, ketamine), produces per-sess
 and pooled activation curves and pSTHs, and tests for state differences.
 """
 
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -38,9 +43,6 @@ ZETA_RESPONSIVE_AMPLITUDES: Optional[List[float]] = [
     7.0,
     60.0,
 ]  # [min, max] mW for initial ZETA; None = all
-ZETA_MIN_AMPLITUDE = (
-    2.0  # fallback min amplitude (V) if ZETA_RESPONSIVE_AMPLITUDES is None
-)
 ZETA_MAX_DUR_MS = 35.0  # ZETA analysis window (ms)
 
 # ── PSTH computation ──────────────────────────────────────────────────────────
@@ -49,20 +51,27 @@ PSTH_WINDOW = (200.0, 500.0)  # (pre_ms, post_ms) for all-neuron PSTHs
 PSTH_WINDOW_RESPONSIVE = (10.0, 50.0)  # (pre_ms, post_ms) for responsive-only plots
 PSTH_BIN_SIZE = 2.5  # ms
 PSTH_SMOOTH_SIGMA_MS = 2  # gaussian smoothing sigma in ms; 0 or None to disable
+PSTH_LAYER_SMOOTH_SIGMA_MS = (
+    4  # extra smoothing applied to layer PSTH traces at plot time
+)
 
 # ── amplitude subsets ─────────────────────────────────────────────────────────
 LAYER_PSTH_AMPLITUDES: Optional[List[float]] = [
     7.0,
     60.0,
 ]  # [min, max] mW for layer PSTH; None = all
-POOLED_AMPLITUDES: Optional[List[float]] = (
-    None  # voltages (V) to pool for combined PSTH; None = skip
-)
+POOLED_AMPLITUDES: Optional[List[float]] = [
+    7.0,
+    60.0,
+]  # [min, max] mW for combined PSTH; None = skip
 
 # ── raster ────────────────────────────────────────────────────────────────────
 RASTER_N_NEURONS = 0  # top-N responsive neurons shown in raster
 RASTER_N_TRIALS = 30  # trials per neuron (at highest amplitude)
 RASTER_MIN_SPIKES = 0.5  # min mean spike count in stim period to be eligible
+
+# ── PSTH display ─────────────────────────────────────────────────────────────
+PSTH_SHOW_LEGEND = False  # show legend on PSTH plots
 
 # ── figure layout (inches) ────────────────────────────────────────────────────
 PSTH_AX_W = 4.5
@@ -75,6 +84,15 @@ _PSTH_M = 0.1  # minimal figure margin
 
 # ── statistics ────────────────────────────────────────────────────────────────
 ALPHA = 0.05  # FDR threshold for Wilcoxon + B-H correction
+
+# ── response probability ───────────────────────────────────────────────────────
+RESP_PROB_K = 1.0          # threshold = baseline_count + K * baseline_std (Poisson)
+RESP_PROB_THRESHOLD = 0.5  # min response probability to call a neuron's amplitude threshold
+
+# ── parallelism ───────────────────────────────────────────────────────────────
+N_WORKERS: Optional[int] = (
+    18  # session worker processes; lower if running low on memory
+)
 
 # ── colors ────────────────────────────────────────────────────────────────────
 COLOR_AWAKE = "#D6604D"
@@ -117,7 +135,9 @@ VOLTAGE_TO_mW = {
     "5": 54.7,
 }
 
-HEATMAP_CLIM_PERCENTILE = 98  # percentile used for heatmap color limits
+HEATMAP_CLIM_PERCENTILE = (
+    98  # upper percentile for heatmap color limits (lower = 100 - this)
+)
 HEATMAP_CMAP = "viridis"  # colormap for awake and ketamine panels
 HEATMAP_DIFF_CMAP = "Greys"  # colormap for the difference panel
 HEATMAP_FIGSIZE = (22, 10)  # fixed figure size for all heatmap plots
@@ -201,6 +221,7 @@ class StateData:
     amplitudes: np.ndarray  # (n_pulses,) V
     responses_df: pd.DataFrame  # columns: unique_id, amplitude, response
     amplitude_stats: pd.DataFrame  # columns: amplitude, mean, sem, n_neurons
+    resp_prob_df: pd.DataFrame  # columns: unique_id, amplitude, response_prob
     bin_centers: np.ndarray  # (n_bins,) ms
     psth: np.ndarray  # (n_bins,) mean across neurons
     psth_sem: np.ndarray  # (n_bins,)
@@ -229,6 +250,7 @@ class SessionResult:
     layer_psths: Optional[dict] = (
         None  # {layer: {"awake": (bc, psth, sem, neuron_psths), "keta": ...}}
     )
+    n_neurons_total: int = 0
     n_responsive_awake: int = 0
     n_responsive_keta: int = 0
     anesthesia_state: str = "ketamine"
@@ -241,6 +263,10 @@ class SessionResult:
     keta_firing_rates: Optional[List[float]] = (
         None  # per-neuron FR in anesthesia window (Hz)
     )
+    awake_neuron_thresholds: Optional[List[float]] = (
+        None  # per-neuron mW threshold where resp_prob >= RESP_PROB_THRESHOLD
+    )
+    keta_neuron_thresholds: Optional[List[float]] = None
 
 
 def load_config(config_path: str = "config.toml") -> dict:
@@ -258,7 +284,7 @@ def filter_neurons(
     rec: Recording,
     layer_filter: Optional[List[str]],
     min_firing_rate_hz: float,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> List[int]:
     """filter neurons by layer and minimum firing rate in the awake window."""
     if not rec.stateTimes:
@@ -267,21 +293,9 @@ def filter_neurons(
         )
 
     df = rec.clusterInfo.copy()
-
     if layer_filter is not None:
         df = df[df["layer"].isin(layer_filter)]
-    n_after_layer = len(df)
-    if verbose and layer_filter is not None:
-        print(
-            f"{_TEAL}\t...Layer filter {layer_filter}: {n_after_layer} neurons{_RESET}"
-        )
-    if verbose:
-        layer_counts_pre = df["layer"].value_counts().sort_index()
-        print(
-            f"{_TEAL}\t...Layer counts before FR filter: { {k: int(v) for k, v in layer_counts_pre.items()} }{_RESET}"
-        )
 
-    # firing rate filter: ≥ min_firing_rate_hz in the awake window only
     awake_start_s, awake_end_s_min = rec.stateTimes["awake"]
     awake_start_s *= 60
     awake_end_s = np.inf if np.isinf(awake_end_s_min) else awake_end_s_min * 60
@@ -299,19 +313,12 @@ def filter_neurons(
         if fr >= min_firing_rate_hz:
             kept.append(uid)
 
-    unit_ids = kept
     if verbose:
-        layer_counts_post = (
-            df[df["cluster_id"].isin(unit_ids)]["layer"].value_counts().sort_index()
-        )
         print(
-            f"{_TEAL}\t...Layer counts after FR filter:  { {k: int(v) for k, v in layer_counts_post.items()} }{_RESET}"
+            f"{_TEAL}\t...{len(kept)}/{len(df)} neurons passed filter "
+            f"(layer={layer_filter}, FR≥{min_firing_rate_hz} Hz){_RESET}"
         )
-        print(
-            f"{_TEAL}\t...{len(unit_ids)}/{n_after_layer} neurons passed FR filter "
-            f"(≥{min_firing_rate_hz} Hz awake){_RESET}"
-        )
-    return unit_ids
+    return kept
 
 
 def calculate_baseline_stats(
@@ -442,6 +449,62 @@ def calculate_responses(
     return pd.DataFrame(rows)
 
 
+def calculate_response_probability(
+    rec,
+    unit_ids: List[int],
+    unique_ids: List[str],
+    pulse_onsets: np.ndarray,
+    amplitudes: np.ndarray,
+    baseline_stats: Dict,
+) -> pd.DataFrame:
+    """per-neuron per-amplitude response probability.
+
+    A trial counts as a response if spike count in PULSE_WINDOW exceeds
+    baseline_count + RESP_PROB_K * baseline_std (Poisson approximation).
+    Returns DataFrame with columns [unique_id, amplitude, response_prob].
+    """
+    pre_s = PSTH_WINDOW[0] / 1000
+    post_s = PSTH_WINDOW[1] / 1000
+    win_lo = PULSE_WINDOW[0] / 1000
+    win_hi = PULSE_WINDOW[1] / 1000
+    win_dur = win_hi - win_lo
+
+    unique_amps = np.unique(amplitudes)
+    amp_onsets = {amp: pulse_onsets[np.isclose(amplitudes, amp)] for amp in unique_amps}
+
+    rows = []
+    for uid, uniq_id in zip(unit_ids, unique_ids):
+        b = baseline_stats[uid]
+        baseline_count = b["mean"] * win_dur
+        baseline_std_count = np.sqrt(b["mean"] * win_dur)  # Poisson
+        threshold_count = baseline_count + RESP_PROB_K * baseline_std_count
+        spikes = rec.unitSpikes[uid]
+        for amp, onsets in amp_onsets.items():
+            trial_counts = []
+            for onset in onsets:
+                rel = spikes - onset
+                n = int(np.sum((rel >= win_lo) & (rel < win_hi)))
+                trial_counts.append(n)
+            prob = float(np.mean(np.array(trial_counts) > threshold_count))
+            rows.append({"unique_id": uniq_id, "amplitude": amp, "response_prob": prob})
+    return pd.DataFrame(rows)
+
+
+def neuron_thresholds_mw(resp_prob_df: pd.DataFrame) -> List[float]:
+    """for each neuron, return the lowest mW amplitude where response_prob >= RESP_PROB_THRESHOLD.
+
+    Neurons that never reach threshold are excluded (not set to NaN) so the
+    distribution reflects only neurons that do respond.
+    """
+    thresholds = []
+    for uid, grp in resp_prob_df.groupby("unique_id"):
+        grp = grp.sort_values("amplitude")
+        above = grp[grp["response_prob"] >= RESP_PROB_THRESHOLD]
+        if len(above):
+            thresholds.append(_volt_to_mw(above["amplitude"].iloc[0]))
+    return thresholds
+
+
 def aggregate_by_amplitude(responses_df: pd.DataFrame) -> pd.DataFrame:
     """average per neuron per amplitude, then compute mean ± SEM across neurons."""
     per_neuron = (
@@ -512,27 +575,47 @@ def calculate_psth(
     return bin_centers, psth, psth_sem, neuron_psths, psth_unit_ids
 
 
-def _zeta_count(rec, unit_ids: List[int], onsets: np.ndarray, amps: np.ndarray) -> int:
-    """count neurons responsive to a single state's onsets via ZETA test."""
+def _available_cores() -> int:
+    """physical core count minus 1 reserved for the OS.
+
+    Uses psutil for an accurate physical count (ignores hyperthreading).
+    Falls back to half of os.cpu_count() if psutil is not installed.
+    """
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False) or os.cpu_count() or 2
+    except ImportError:
+        physical = max(2, (os.cpu_count() or 2) // 2)
+    return max(1, physical - 1)
+
+
+def _zeta_pvals(spike_arrays: List[np.ndarray], onsets: np.ndarray) -> List[float]:
+    """run ZETA sequentially across neurons; boolParallel=False avoids nested Pool inside daemon workers."""
     import logging
 
     from zetapy import zetatest
 
-    mask = amps > ZETA_MIN_AMPLITUDE
-    filtered = onsets[mask] if mask.any() else onsets
-    if len(filtered) == 0:
-        return 0
     dur = ZETA_MAX_DUR_MS / 1000.0
-    _root_level = logging.root.level
-    logging.root.setLevel(logging.CRITICAL)
-    try:
-        result = sum(
-            zetatest(rec.unitSpikes[uid], filtered, dblUseMaxDur=dur)[0] <= ALPHA
-            for uid in unit_ids
-        )
-    finally:
-        logging.root.setLevel(_root_level)
-    return result
+    p_values = []
+    for spikes in spike_arrays:
+        _level = logging.root.level
+        logging.root.setLevel(logging.CRITICAL)
+        try:
+            p_values.append(
+                zetatest(spikes, onsets, dblUseMaxDur=dur, boolParallel=False)[0]
+            )
+        finally:
+            logging.root.setLevel(_level)
+    return p_values
+
+
+def _zeta_count(rec, unit_ids: List[int], onsets: np.ndarray, amps: np.ndarray) -> int:
+    """count neurons responsive to a single state's onsets via ZETA test."""
+    if len(onsets) == 0 or not unit_ids:
+        return 0
+    p_values = _zeta_pvals([rec.unitSpikes[uid] for uid in unit_ids], onsets)
+    return sum(p <= ALPHA for p in p_values)
 
 
 def identify_responsive_neurons_zeta(
@@ -545,42 +628,25 @@ def identify_responsive_neurons_zeta(
 ) -> List[int]:
     """run ZETA test using trials from both states combined; returns unit_ids with p <= ALPHA.
 
-    Only trials within ZETA_RESPONSIVE_AMPLITUDES [min, max] mW are used (or > ZETA_MIN_AMPLITUDE V
-    if ZETA_RESPONSIVE_AMPLITUDES is None).
+    If ZETA_RESPONSIVE_AMPLITUDES is set, only trials within [min, max] mW are used.
+    If None, all trials are used.
     """
-    from zetapy import zetatest
-
     if ZETA_RESPONSIVE_AMPLITUDES is not None:
         lo_mw, hi_mw = ZETA_RESPONSIVE_AMPLITUDES
         a_mw = np.array([_volt_to_mw(v) for v in awake_amps])
         k_mw = np.array([_volt_to_mw(v) for v in keta_amps])
         mask_awake = (a_mw >= lo_mw) & (a_mw <= hi_mw)
         mask_keta = (k_mw >= lo_mw) & (k_mw <= hi_mw)
-    else:
-        mask_awake = awake_amps > ZETA_MIN_AMPLITUDE
-        mask_keta = keta_amps > ZETA_MIN_AMPLITUDE
-
-    onsets = np.sort(np.concatenate([awake_onsets[mask_awake], keta_onsets[mask_keta]]))
-    if len(onsets) == 0:
-        print(
-            "  [ZETA] No trials in ZETA_RESPONSIVE_AMPLITUDES range — falling back to all trials"
+        onsets = np.sort(
+            np.concatenate([awake_onsets[mask_awake], keta_onsets[mask_keta]])
         )
+        if len(onsets) == 0:
+            onsets = np.sort(np.concatenate([awake_onsets, keta_onsets]))
+    else:
         onsets = np.sort(np.concatenate([awake_onsets, keta_onsets]))
 
-    import logging
-
-    dur = ZETA_MAX_DUR_MS / 1000.0
-    _root_level = logging.root.level
-    logging.root.setLevel(logging.CRITICAL)
-    try:
-        result = [
-            uid
-            for uid in unit_ids
-            if zetatest(rec.unitSpikes[uid], onsets, dblUseMaxDur=dur)[0] <= ALPHA
-        ]
-    finally:
-        logging.root.setLevel(_root_level)
-    return result
+    p_values = _zeta_pvals([rec.unitSpikes[uid] for uid in unit_ids], onsets)
+    return [uid for uid, p in zip(unit_ids, p_values) if p <= ALPHA]
 
 
 def identify_responsive_neurons(
@@ -624,18 +690,25 @@ def _filter_state_to_responsive(
     row_mask = [i for i, uid in enumerate(state.psth_unit_ids) if uid in uid_set]
     new_psths = state.neuron_psths[row_mask]
     new_uids = [state.psth_unit_ids[i] for i in row_mask]
-    new_psth = np.mean(new_psths, axis=0)
-    new_sem = np.std(new_psths, axis=0) / np.sqrt(len(new_psths))
+    n_bins = state.neuron_psths.shape[1] if state.neuron_psths.ndim == 2 else 0
+    if len(new_psths) == 0:
+        new_psth = np.zeros(n_bins)
+        new_sem = np.zeros(n_bins)
+    else:
+        new_psth = np.mean(new_psths, axis=0)
+        new_sem = np.std(new_psths, axis=0) / np.sqrt(len(new_psths))
 
     # filter responses and recompute amplitude stats
     new_resp_df = state.responses_df[state.responses_df["unique_id"].isin(uniq_set)]
     new_amp_stats = aggregate_by_amplitude(new_resp_df)
+    new_resp_prob_df = state.resp_prob_df[state.resp_prob_df["unique_id"].isin(uniq_set)]
 
     return StateData(
         pulse_onsets=state.pulse_onsets,
         amplitudes=state.amplitudes,
         responses_df=new_resp_df,
         amplitude_stats=new_amp_stats,
+        resp_prob_df=new_resp_prob_df,
         bin_centers=state.bin_centers,
         psth=new_psth,
         psth_sem=new_sem,
@@ -653,11 +726,11 @@ def process_state(
     state_window: Tuple[float, float],
 ) -> StateData:
     """full analysis pipeline for one brain state."""
-    baseline_stats = None
-    if ZSCORE:
-        baseline_stats = calculate_baseline_stats(
-            rec, unit_ids, pulse_onsets, BASELINE_EXCLUSION, state_window
-        )
+    # always compute baseline_stats — needed for both z-scoring and response probability
+    baseline_stats = calculate_baseline_stats(
+        rec, unit_ids, pulse_onsets, BASELINE_EXCLUSION, state_window
+    )
+    baseline_stats_for_psth = baseline_stats if ZSCORE else None
 
     responses_df = calculate_responses(
         rec,
@@ -666,16 +739,19 @@ def process_state(
         pulse_onsets,
         amplitudes,
         PULSE_WINDOW,
-        baseline_stats,
+        baseline_stats_for_psth,
         ZSCORE,
     )
     amplitude_stats = aggregate_by_amplitude(responses_df)
+    resp_prob_df = calculate_response_probability(
+        rec, unit_ids, unique_ids, pulse_onsets, amplitudes, baseline_stats
+    )
     bin_centers, psth, psth_sem, neuron_psths, psth_unit_ids = calculate_psth(
         rec,
         unit_ids,
         pulse_onsets,
         amplitudes,
-        baseline_stats,
+        baseline_stats_for_psth,
         ZSCORE,
     )
     return StateData(
@@ -683,6 +759,7 @@ def process_state(
         amplitudes=amplitudes,
         responses_df=responses_df,
         amplitude_stats=amplitude_stats,
+        resp_prob_df=resp_prob_df,
         bin_centers=bin_centers,
         psth=psth,
         psth_sem=psth_sem,
@@ -710,25 +787,11 @@ def _collect_raster_spikes(
 
 def _zeta_responsive_at_amp(rec, candidate_ids, a_onsets, k_onsets):
     """run ZETA using trials from both states at a single amplitude; return responsive IDs."""
-    import logging
-
-    from zetapy import zetatest
-
     onsets = np.sort(np.concatenate([a_onsets, k_onsets]))
-    if len(onsets) == 0:
+    if len(onsets) == 0 or not candidate_ids:
         return []
-    dur = ZETA_MAX_DUR_MS / 1000.0
-    _root_level = logging.root.level
-    logging.root.setLevel(logging.CRITICAL)
-    try:
-        result = [
-            uid
-            for uid in candidate_ids
-            if zetatest(rec.unitSpikes[uid], onsets, dblUseMaxDur=dur)[0] <= ALPHA
-        ]
-    finally:
-        logging.root.setLevel(_root_level)
-    return result
+    p_values = _zeta_pvals([rec.unitSpikes[uid] for uid in candidate_ids], onsets)
+    return [uid for uid, p in zip(candidate_ids, p_values) if p <= ALPHA]
 
 
 def _compute_per_amp_psths(
@@ -790,14 +853,18 @@ def _compute_per_amp_psths(
             continue
 
         # raster from the per-amp responsive set (top neuron by awake response)
-        win_mask = (a_bc >= PULSE_WINDOW[0]) & (a_bc <= PULSE_WINDOW[1])
-        if len(resp_ids) > 0 and a_mats.shape[1] > 0:
-            top_idx = int(np.argmax(a_mats[:, win_mask].mean(axis=1)))
-            raster_ids_amp = [resp_ids[top_idx]]
+        if RASTER_N_NEURONS > 0:
+            win_mask = (a_bc >= PULSE_WINDOW[0]) & (a_bc <= PULSE_WINDOW[1])
+            if len(resp_ids) > 0 and a_mats.shape[1] > 0:
+                top_idx = int(np.argmax(a_mats[:, win_mask].mean(axis=1)))
+                raster_ids_amp = [resp_ids[top_idx]]
+            else:
+                raster_ids_amp = raster_uids
+            a_raster = _collect_raster_spikes(rec, raster_ids_amp, a_onsets)
+            k_raster = _collect_raster_spikes(rec, raster_ids_amp, k_onsets)
         else:
-            raster_ids_amp = raster_uids
-        a_raster = _collect_raster_spikes(rec, raster_ids_amp, a_onsets)
-        k_raster = _collect_raster_spikes(rec, raster_ids_amp, k_onsets)
+            a_raster = []
+            k_raster = []
 
         entry = {
             "awake": (a_bc, a_psth, a_sem, a_mats, a_raster),
@@ -829,16 +896,11 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
     recording_dir = paths["recording_dir"]
     output_dir = create_output_dir(recording_dir, config)
 
-    print("=" * 70)
-    print(f"SESSION: {session_name}")
-    print("=" * 70)
-
     # 1. Load pre-computed pulse table (produced by run_alignment.py)
-    print("\n[1/3] Loading pulse table...")
     stim_file = output_dir / "stim_amplitudes.csv"
     if not stim_file.exists():
         raise FileNotFoundError(f"{stim_file} not found. Run run_alignment.py first.")
-    stim_df = pd.read_csv(stim_file)
+    stim_df = pd.read_csv(stim_file).dropna(subset=["onset_time_s", "amplitude_v"])
     anesthesia_state = stim_df.loc[
         stim_df["brain_state"] != "awake", "brain_state"
     ].iloc[0]
@@ -848,24 +910,17 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
     awake_amps = awake_df["amplitude_v"].values
     keta_onsets = keta_df["onset_time_s"].values
     keta_amps = keta_df["amplitude_v"].values
-    print(
-        f"{_TEAL}  {len(awake_onsets)} awake pulses | {len(keta_onsets)} {anesthesia_state} pulses{_RESET}"
-    )
 
     # 2. Load recording and filter neurons
-    print("\n[2/3] Loading recording...")
     rec = Recording(recording_dir, config)
     unit_ids = filter_neurons(rec, _CORTEX_LAYERS, MIN_FIRING_RATE_HZ)
+    n_neurons_total = len(unit_ids)
     unique_ids = [f"{session_name}_{uid}" for uid in unit_ids]
-    print(f"{_TEAL}  {len(unit_ids)} neurons included{_RESET}")
 
     # 3. Analyse each state (all neurons passing layer + spike filter)
-    print("\n[3/3] Computing responses...")
-    print("  — Awake")
     awake_data_all = process_state(
         rec, unit_ids, unique_ids, awake_onsets, awake_amps, rec.stateTimes["awake"]
     )
-    print(f"  — {anesthesia_state.title()}")
     keta_data_all = process_state(
         rec,
         unit_ids,
@@ -891,10 +946,6 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
             rec, unit_ids, awake_onsets, awake_amps, keta_onsets, keta_amps
         )
         responsive_unique = [f"{session_name}_{uid}" for uid in responsive_ids]
-        print(
-            f"{_TEAL}\t...{len(responsive_ids)}/{len(unit_ids)} responsive neurons "
-            f"(ZETA p <= {ALPHA}, both states, amplitude > {ZETA_MIN_AMPLITUDE} V){_RESET}"
-        )
         awake_data = _filter_state_to_responsive(
             awake_data_all, responsive_ids, responsive_unique
         )
@@ -919,10 +970,6 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
             awake_data_all.bin_centers,
         )
         responsive_unique = [f"{session_name}_{uid}" for uid in responsive_ids]
-        print(
-            f"{_TEAL}\t...{len(responsive_ids)}/{len(unit_ids)} responsive neurons "
-            f"(mean z > {RESPONSIVE_ZSCORE_THRESHOLD} in PULSE_WINDOW, awake){_RESET}"
-        )
         awake_data = _filter_state_to_responsive(
             awake_data_all, responsive_ids, responsive_unique
         )
@@ -936,14 +983,23 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
         awake_data = awake_data_all
         keta_data = keta_data_all
 
-    # per-state responsive counts for boxplot — layer filter only, no spike count minimum
+    # per-state responsive counts for boxplot — LAYER_PSTH_AMPLITUDES range, layer filter only
     unit_ids_unfiltered = filter_neurons(rec, _CORTEX_LAYERS, 0)
     if RESPONSIVE_NEURON_DETECTION == "zeta":
+        if LAYER_PSTH_AMPLITUDES is not None:
+            _bp_lo, _bp_hi = LAYER_PSTH_AMPLITUDES
+            _a_mw = np.array([_volt_to_mw(v) for v in awake_amps])
+            _k_mw = np.array([_volt_to_mw(v) for v in keta_amps])
+            _bp_a_mask = (_a_mw >= _bp_lo) & (_a_mw <= _bp_hi)
+            _bp_k_mask = (_k_mw >= _bp_lo) & (_k_mw <= _bp_hi)
+        else:
+            _bp_a_mask = np.ones(len(awake_amps), dtype=bool)
+            _bp_k_mask = np.ones(len(keta_amps), dtype=bool)
         n_responsive_awake = _zeta_count(
-            rec, unit_ids_unfiltered, awake_onsets, awake_amps
+            rec, unit_ids_unfiltered, awake_onsets[_bp_a_mask], awake_amps[_bp_a_mask]
         )
         n_responsive_keta = _zeta_count(
-            rec, unit_ids_unfiltered, keta_onsets, keta_amps
+            rec, unit_ids_unfiltered, keta_onsets[_bp_k_mask], keta_amps[_bp_k_mask]
         )
     elif RESPONSIVE_ZSCORE_THRESHOLD is not None:
         n_responsive_awake = len(
@@ -1011,23 +1067,24 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
     keta_data.raster_unit_ids = raster_uids
     keta_data.raster_spikes = _collect_raster_spikes(rec, raster_uids, keta_max_onsets)
 
+    ac_dir = output_dir / "activation_curve"
+    ac_dir.mkdir(exist_ok=True)
     awake_data.amplitude_stats.to_csv(
-        output_dir / "amplitude_response_awake.csv", index=False
+        ac_dir / "amplitude_response_awake.csv", index=False
     )
     keta_data.amplitude_stats.to_csv(
-        output_dir / f"amplitude_response_{anesthesia_state}.csv", index=False
+        ac_dir / f"amplitude_response_{anesthesia_state}.csv", index=False
     )
 
-    print(f"\n  Activation thresholds ({session_name}):")
     find_activation_threshold(
         awake_data.responses_df,
         "awake",
-        output_path=output_dir / "threshold_awake.csv",
+        output_path=ac_dir / "threshold_awake.csv",
     )
     find_activation_threshold(
         keta_data.responses_df,
         anesthesia_state,
-        output_path=output_dir / f"threshold_{anesthesia_state}.csv",
+        output_path=ac_dir / f"threshold_{anesthesia_state}.csv",
     )
 
     # compute separate PSTHs for each PSTH_AREA_GROUPS entry (no responsiveness filter)
@@ -1067,7 +1124,6 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
                 k_state.neuron_psths,
             ),
         }
-        print(f"{_TEAL}  Area '{area_name}': {len(area_ids)} neurons{_RESET}")
 
     # compute per-cortical-layer PSTHs (no responsiveness filter)
     if LAYER_PSTH_AMPLITUDES is not None:
@@ -1118,7 +1174,6 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
                 k_state.neuron_psths,
             ),
         }
-        print(f"{_TEAL}  Layer '{layer_name}': {len(layer_ids)} neurons{_RESET}")
 
     per_amp_psths = _compute_per_amp_psths(
         rec,
@@ -1151,12 +1206,15 @@ def process_session(session_dir: Path, config: dict) -> SessionResult:
         cluster_info=cluster_info,
         area_psths=area_psths,
         layer_psths=layer_psths,
+        n_neurons_total=n_neurons_total,
         n_responsive_awake=n_responsive_awake,
         n_responsive_keta=n_responsive_keta,
         anesthesia_state=anesthesia_state,
         per_amp_psths=per_amp_psths,
         awake_firing_rates=awake_frs,
         keta_firing_rates=keta_frs,
+        awake_neuron_thresholds=neuron_thresholds_mw(awake_data.resp_prob_df),
+        keta_neuron_thresholds=neuron_thresholds_mw(keta_data.resp_prob_df),
     )
 
 
@@ -1167,6 +1225,9 @@ def pool_sessions(results: List[SessionResult]) -> dict:
 
     awake_stats = aggregate_by_amplitude(awake_resp)
     keta_stats = aggregate_by_amplitude(keta_resp)
+
+    awake_resp_prob = pd.concat([r.awake.resp_prob_df for r in results], ignore_index=True)
+    keta_resp_prob = pd.concat([r.ketamine.resp_prob_df for r in results], ignore_index=True)
 
     awake_psths = np.vstack([r.awake.neuron_psths for r in results])
     keta_psths = np.vstack([r.ketamine.neuron_psths for r in results])
@@ -1404,6 +1465,14 @@ def pool_sessions(results: List[SessionResult]) -> dict:
         "keta_firing_rates": [
             fr for r in results for fr in (r.keta_firing_rates or [])
         ],
+        "awake_resp_prob": awake_resp_prob,
+        "keta_resp_prob": keta_resp_prob,
+        "awake_neuron_thresholds": [
+            t for r in results for t in (r.awake_neuron_thresholds or [])
+        ],
+        "keta_neuron_thresholds": [
+            t for r in results for t in (r.keta_neuron_thresholds or [])
+        ],
     }
 
 
@@ -1421,6 +1490,20 @@ def _bh_correction(p_values: np.ndarray, alpha: float = ALPHA) -> np.ndarray:
     reject = np.zeros(n, dtype=bool)
     reject[order[: np.where(below)[0][-1] + 1]] = True
     return reject
+
+
+def _wilcoxon(*args, **kwargs):
+    """wilcoxon wrapper that suppresses degenerate-data RuntimeWarnings (e.g. all-zero differences)."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", category=RuntimeWarning, message="Degrees of freedom"
+        )
+        warnings.filterwarnings(
+            "ignore", category=RuntimeWarning, message="invalid value"
+        )
+        return scipy.stats.wilcoxon(*args, **kwargs)
 
 
 def run_stats(
@@ -1455,7 +1538,7 @@ def run_stats(
                 {"amplitude": amp, "statistic": np.nan, "p_value": 1.0, "n": len(sub)}
             )
             continue
-        stat, p = scipy.stats.wilcoxon(sub["response_awake"], sub["response_keta"])
+        stat, p = _wilcoxon(sub["response_awake"], sub["response_keta"])
         rows.append({"amplitude": amp, "statistic": stat, "p_value": p, "n": len(sub)})
 
     stats_df = pd.DataFrame(rows)
@@ -1463,6 +1546,12 @@ def run_stats(
     stats_df["n_neurons"] = n_neurons
     stats_df["n_sessions"] = n_sessions
     return stats_df
+
+
+def _bc_psth(bc: np.ndarray, psth: np.ndarray) -> np.ndarray:
+    """subtract pre-stimulus mean from psth (baseline correction)."""
+    pre = psth[bc < 0]
+    return psth - (pre.mean() if len(pre) else 0.0)
 
 
 def run_psth_stats(
@@ -1478,7 +1567,7 @@ def run_psth_stats(
     keta_vals = keta_psths[:, mask].mean(axis=1)
     n = len(awake_vals)
     if n >= 5:
-        stat, p = scipy.stats.wilcoxon(awake_vals, keta_vals)
+        stat, p = _wilcoxon(awake_vals, keta_vals)
     else:
         stat, p = np.nan, 1.0
     df = pd.DataFrame(
@@ -1525,12 +1614,17 @@ def find_activation_threshold(
     """
     from scipy.optimize import curve_fit
 
+    if responses_df.empty:
+        return {}
+
     per_neuron = (
         responses_df.groupby(["unique_id", "amplitude"])["response"]
         .mean()
         .reset_index()
     )
     amps = np.array(sorted(per_neuron["amplitude"].unique()))
+    if len(amps) == 0:
+        return {}
 
     rows = []
     for amp in amps:
@@ -1545,7 +1639,7 @@ def find_activation_threshold(
                 }
             )
             continue
-        _, p = scipy.stats.wilcoxon(vals, alternative="greater")
+        _, p = _wilcoxon(vals, alternative="greater")
         rows.append(
             {
                 "amplitude": amp,
@@ -1590,19 +1684,6 @@ def find_activation_threshold(
     threshold_wilcoxon_mw = (
         _volt_to_mw(threshold_wilcoxon_v) if threshold_wilcoxon_v is not None else None
     )
-
-    if threshold_wilcoxon_v is not None:
-        print(
-            f"{_TEAL}  [{label}] threshold (wilcoxon): {threshold_wilcoxon_v:.3f} V / {threshold_wilcoxon_mw:.1f} mW/mm²{_RESET}"
-        )
-    else:
-        print(f"{_TEAL}  [{label}] threshold (wilcoxon): not found{_RESET}")
-    if threshold_bp_mw is not None:
-        print(
-            f"{_TEAL}  [{label}] threshold (breakpoint fit): {threshold_bp_mw:.1f} mW/mm²{_RESET}"
-        )
-    else:
-        print(f"{_TEAL}  [{label}] threshold (breakpoint fit): fit failed{_RESET}")
 
     df["amplitude_mw"] = df["amplitude"].map(_volt_to_mw)
     if output_path is not None:
@@ -1783,6 +1864,9 @@ def plot_psth(
 
     plt.rcParams.update(_ACTIVE_STYLE)
     has_raster = awake_raster is not None and len(awake_raster) > 0
+    if not has_raster:
+        legend_outside = True
+    show_legend = PSTH_SHOW_LEGEND
 
     ax_w = PSTH_AX_W / 2 if window is PSTH_WINDOW_RESPONSIVE else PSTH_AX_W
     fig_w = _PSTH_M + ax_w + _PSTH_M
@@ -1943,7 +2027,7 @@ def plot_psth(
     else:
         ax.set_ylabel("Firing Rate (Hz)")
 
-    if has_raster:
+    if show_legend:
         from matplotlib.lines import Line2D
 
         handles = [
@@ -1970,8 +2054,9 @@ def plot_psth(
                         label=f"{tr['label']} ({keta_label})",
                     )
                 )
+        legend_ax = ax_raster if has_raster else ax
         if legend_outside:
-            ax_raster.legend(
+            legend_ax.legend(
                 handles=handles,
                 frameon=False,
                 loc="upper left",
@@ -1979,17 +2064,7 @@ def plot_psth(
                 borderaxespad=0,
             )
         else:
-            ax_raster.legend(handles=handles, frameon=True, loc="upper right")
-    else:
-        if legend_outside:
-            ax.legend(
-                frameon=False,
-                loc="upper left",
-                bbox_to_anchor=(1.01, 1),
-                borderaxespad=0,
-            )
-        else:
-            ax.legend(frameon=True, loc="upper right")
+            legend_ax.legend(handles=handles, frameon=True, loc="upper right")
 
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -2014,6 +2089,8 @@ def plot_psth(
         if not has_sig_bars:
             ylim_top = data_ymax  # actual max including SEM
     ax.set_yticks(yticks)
+    if ylim_top <= ylim_bottom:
+        ylim_top = ylim_bottom + 1.0
     ax.set_ylim(ylim_bottom, ylim_top)
 
     if has_raster:
@@ -2097,13 +2174,37 @@ def _draw_psth_heatmap(
     boundaries, label_info = _get_layer_boundaries(layers)
     n_neurons = len(awake_mat)
 
-    combined = np.concatenate([awake_mat.ravel(), keta_mat.ravel()])
-    vmax = np.percentile(combined, HEATMAP_CLIM_PERCENTILE)
-    vmin = np.percentile(combined, 100 - HEATMAP_CLIM_PERCENTILE) if ZSCORE else 0.0
-    diff_lim = np.percentile(np.abs(diff_mat), HEATMAP_CLIM_PERCENTILE)
+    # baseline-correct each neuron by subtracting its pre-stimulus mean (nan-safe)
+    pre_mask = bin_centers < 0
+    if pre_mask.any() and awake_mat.shape[0] > 0:
+        awake_mat = awake_mat - np.nanmean(
+            awake_mat[:, pre_mask], axis=1, keepdims=True
+        )
+    if pre_mask.any() and keta_mat.shape[0] > 0:
+        keta_mat = keta_mat - np.nanmean(keta_mat[:, pre_mask], axis=1, keepdims=True)
+    if awake_mat.shape == keta_mat.shape:
+        diff_mat = keta_mat - awake_mat
 
-    ylabel = "Z-score" if ZSCORE else "Firing Rate (Hz)"
-    diff_ylabel = "ΔZ" if ZSCORE else "ΔHz"
+    combined = np.concatenate([awake_mat.ravel(), keta_mat.ravel()])
+    finite_vals = combined[np.isfinite(combined)]
+    if finite_vals.size == 0:
+        plt.close("all")
+        return
+    vmax = np.percentile(finite_vals, HEATMAP_CLIM_PERCENTILE)
+    vmin = np.percentile(finite_vals, 100 - HEATMAP_CLIM_PERCENTILE)
+    if vmax == vmin:
+        plt.close("all")
+        return
+    diff_finite = diff_mat.ravel() if diff_mat.size > 0 else np.array([])
+    diff_finite = diff_finite[np.isfinite(diff_finite)]
+    diff_lim = (
+        np.percentile(np.abs(diff_finite), HEATMAP_CLIM_PERCENTILE)
+        if diff_finite.size > 0
+        else 1.0
+    )
+
+    ylabel = "Z-score" if ZSCORE else "ΔFR (Hz)"
+    diff_ylabel = "ΔZ" if ZSCORE else "ΔFR (Hz)"
 
     # layout: awake | keta | colorbar | spacer | diff  (diff gets its own colorbar appended right)
     fig = plt.figure(figsize=HEATMAP_FIGSIZE)
@@ -2322,13 +2423,16 @@ def plot_psth_layers(
     if not layer_psths:
         return
 
-    def _norm(psth, sem, bc):
+    def _baseline_subtract(psth, sem, bc):
         pre = psth[bc < 0]
-        corrected = psth - (np.median(pre) if len(pre) else 0.0)
-        peak = corrected.max()
-        if peak <= 0:
-            return corrected, sem
-        return corrected / peak, sem / peak
+        baseline = np.median(pre) if len(pre) else 0.0
+        return psth - baseline, sem
+
+    def _smooth(arr):
+        if not PSTH_LAYER_SMOOTH_SIGMA_MS:
+            return arr
+        sigma_bins = PSTH_LAYER_SMOOTH_SIGMA_MS / PSTH_BIN_SIZE
+        return scipy.ndimage.gaussian_filter1d(arr, sigma=sigma_bins)
 
     plt.rcParams.update(_ACTIVE_STYLE)
 
@@ -2357,10 +2461,13 @@ def plot_psth_layers(
     ax.axvline(0, color=_ZERO_COLOR, linewidth=1, alpha=0.5)
 
     ytick_pos = []
+    data_min = np.inf
+    data_max = -np.inf
     for i, lyr in enumerate(present):
         offset = i * PSTH_LAYER_OFFSET
         bc, psth, sem = layer_psths[lyr][state][:3]
-        psth, sem = _norm(psth, sem, bc)
+        psth, sem = _baseline_subtract(psth, sem, bc)
+        psth, sem = _smooth(psth), _smooth(sem)
         c = colors[lyr]
         zo = n - i  # layer 6 (i=0) gets highest zorder
         ax.fill_between(
@@ -2374,16 +2481,27 @@ def plot_psth_layers(
         )
         ax.plot(bc, psth + offset, color=c, linewidth=2, zorder=zo)
         ytick_pos.append(offset)
+        onset_idx = int(np.argmin(np.abs(bc)))
+        data_min = min(data_min, (psth + offset)[onset_idx])
+        data_max = max(data_max, (psth + offset).max())
+
+    if not np.isfinite(data_min) or not np.isfinite(data_max) or data_max <= data_min:
+        ylim_lo, ylim_hi = ytick_pos[0] - 0.15, ytick_pos[-1] + 1.1
+    else:
+        y_span = data_max - data_min
+        ylim_lo = data_min - 0.05 * y_span
+        ylim_hi = data_max
 
     xmin, xmax = -PSTH_WINDOW[0], PSTH_WINDOW[1]
     ax.set_xlim(xmin, xmax)
     ax.set_xticks([0, int(xmax // 2), int(xmax)])
     ax.set_xticklabels(["0", str(int(xmax // 2)), str(int(xmax))])
     ax.set_xlabel("Time from Onset (ms)")
-    ax.set_ylabel("Layer")
+    # ax.set_ylabel("Layer")
     ax.set_yticks(ytick_pos)
     ax.set_yticklabels([f"L{lyr}" for lyr in present])
-    ax.set_ylim(ytick_pos[0] - 0.15, ytick_pos[-1] + 1.1)
+    ax.tick_params(axis="y", length=0)
+    ax.set_ylim(ylim_lo, ylim_hi)
 
     for tick, lyr in zip(ax.yaxis.get_ticklabels(), present):
         tick.set_color(colors[lyr])
@@ -2462,9 +2580,23 @@ def plot_psth_heatmap_responsive_comparison(
     awake_mat = awake_mat[:, t_mask]
     keta_mat = keta_mat[:, t_mask]
 
+    # baseline-correct per neuron (subtract pre-stim mean, nan-safe)
+    pre_mask_resp = bc < 0
+    if pre_mask_resp.any():
+        awake_mat = awake_mat - np.nanmean(
+            awake_mat[:, pre_mask_resp], axis=1, keepdims=True
+        )
+        keta_mat = keta_mat - np.nanmean(
+            keta_mat[:, pre_mask_resp], axis=1, keepdims=True
+        )
+
     # sort by mean awake firing rate in PULSE_WINDOW (descending = highest at top)
     win_mask = (bc >= PULSE_WINDOW[0]) & (bc <= PULSE_WINDOW[1])
-    sort_key = awake_mat[:, win_mask].mean(axis=1)
+    sort_key = (
+        awake_mat[:, win_mask].mean(axis=1)
+        if win_mask.any()
+        else awake_mat.mean(axis=1)
+    )
     order = np.argsort(sort_key)[::-1]
     awake_mat = awake_mat[order]
     keta_mat = keta_mat[order]
@@ -2472,8 +2604,13 @@ def plot_psth_heatmap_responsive_comparison(
     N, n_bins = awake_mat.shape
     combined = np.concatenate([awake_mat, keta_mat], axis=1)  # (N, 2*n_bins)
 
-    vmin = 0.0
-    vmax = np.percentile(combined, 99)
+    finite_vals = combined.ravel()[np.isfinite(combined.ravel())]
+    if finite_vals.size == 0:
+        return
+    vmax = np.percentile(finite_vals, HEATMAP_CLIM_PERCENTILE)
+    vmin = np.percentile(finite_vals, 100 - HEATMAP_CLIM_PERCENTILE)
+    if vmax == vmin:
+        return
 
     ax_w = PSTH_AX_W / 2
     ax_h = max(2.0, min(N * 0.02, 8.0))
@@ -2553,7 +2690,7 @@ def plot_psth_heatmap_responsive_comparison(
     ax.spines["right"].set_visible(False)
 
     cb = fig.colorbar(im, cax=cax)
-    cb.set_label("Firing Rate (Hz)")
+    cb.set_label("ΔFR (Hz)")
     if DARK_MODE:
         cb.ax.yaxis.set_tick_params(color="white")
         cb.outline.set_edgecolor("white")
@@ -2597,8 +2734,8 @@ def plot_firing_rate_comparison(
         (1, awake_frs, COLOR_AWAKE),
         (2, keta_frs, keta_color),
     ]:
-        jitter = rng.uniform(-0.08, 0.08, len(frs))
-        ax.scatter(x_center + jitter, frs, color=color, s=20, zorder=5, alpha=0.6)
+        jitter = rng.uniform(-0.1, 0.1, len(frs))
+        ax.scatter(x_center + jitter, frs, color=color, s=20, zorder=5, alpha=0.1)
 
     from scipy.stats import mannwhitneyu
 
@@ -2636,6 +2773,113 @@ def plot_firing_rate_comparison(
     ax.spines["right"].set_visible(False)
     ax.spines["bottom"].set_visible(False)
     ax.tick_params(axis="x", length=0)
+    _save(output_path, dpi=300)
+    plt.close()
+
+
+def plot_resp_prob_curve(
+    awake_prob_df: pd.DataFrame,
+    keta_prob_df: pd.DataFrame,
+    output_path: Path,
+    title: str = "Response Probability",
+    keta_color: str = ANESTHESIA_COLORS["ketamine"],
+    keta_label: str = "Ketamine",
+):
+    """activation curve with y = mean response probability across neurons (0–1)."""
+    plt.rcParams.update(_ACTIVE_STYLE)
+    fig, ax = plt.subplots()
+
+    for df, color, label in [
+        (awake_prob_df, COLOR_AWAKE, "Awake"),
+        (keta_prob_df, keta_color, keta_label),
+    ]:
+        stats = (
+            df.groupby("amplitude")["response_prob"]
+            .agg(mean="mean", sem=lambda x: x.std() / np.sqrt(len(x)))
+            .reset_index()
+        )
+        mw = stats["amplitude"].map(_volt_to_mw)
+        ax.plot(mw, stats["mean"], color=color, marker="o", label=label)
+        ax.fill_between(
+            mw,
+            stats["mean"] - stats["sem"],
+            stats["mean"] + stats["sem"],
+            color=color,
+            alpha=0.25,
+            linewidth=0,
+        )
+
+    all_mw = pd.concat(
+        [awake_prob_df["amplitude"], keta_prob_df["amplitude"]]
+    ).map(_volt_to_mw)
+    ax.set_xlim(all_mw.min(), all_mw.max())
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Illumination Intensity (mW/mm²)")
+    ax.set_ylabel(f"Response Probability (k={RESP_PROB_K})")
+    ax.set_title(title)
+    ax.legend(frameon=False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    _save(output_path, dpi=300)
+    plt.close()
+
+
+def plot_resp_prob_thresholds(
+    awake_thresholds: List[float],
+    keta_thresholds: List[float],
+    output_path: Path,
+    keta_color: str = ANESTHESIA_COLORS["ketamine"],
+    keta_label: str = "Ketamine",
+):
+    """boxplot + jitter of per-neuron response-probability thresholds by state."""
+    plt.rcParams.update(_ACTIVE_STYLE)
+    fig_w = _PSTH_M + 1.5 + _PSTH_M
+    fig_h = _PSTH_M + PSTH_AX_H + _PSTH_M
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    ax = fig.add_axes([_PSTH_M / fig_w, _PSTH_M / fig_h, 1.5 / fig_w, PSTH_AX_H / fig_h])
+
+    data = [awake_thresholds, keta_thresholds]
+    colors = [COLOR_AWAKE, keta_color]
+    labels = ["Awake", keta_label]
+
+    bp = ax.boxplot(
+        data,
+        positions=[1, 2],
+        widths=0.5,
+        patch_artist=True,
+        showfliers=False,
+        medianprops=dict(color=_FOREGROUND_COLOR, linewidth=2),
+        whiskerprops=dict(color=_FOREGROUND_COLOR, linewidth=1.5),
+        capprops=dict(color=_FOREGROUND_COLOR, linewidth=1.5),
+    )
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.5)
+        patch.set_linewidth(0)
+
+    rng = np.random.default_rng(0)
+    for x_center, vals, color in zip([1, 2], data, colors):
+        jitter = rng.uniform(-0.12, 0.12, size=len(vals))
+        ax.scatter(
+            x_center + jitter, vals, color=color, alpha=0.6, s=18, linewidths=0, zorder=3
+        )
+
+    # Wilcoxon test if both have data
+    if len(awake_thresholds) >= 5 and len(keta_thresholds) >= 5:
+        from scipy.stats import mannwhitneyu
+        _, p = mannwhitneyu(awake_thresholds, keta_thresholds, alternative="two-sided")
+        y_top = max(max(awake_thresholds, default=0), max(keta_thresholds, default=0))
+        ax.plot([1, 2], [y_top * 1.07, y_top * 1.07], color=_FOREGROUND_COLOR, linewidth=1)
+        pstr = f"p={p:.3f}" if p >= 0.001 else "p<0.001"
+        ax.text(1.5, y_top * 1.09, pstr, ha="center", va="bottom", fontsize=10)
+
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Response Threshold (mW/mm²)")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
     _save(output_path, dpi=300)
     plt.close()
 
@@ -2694,7 +2938,7 @@ def plot_responsive_count_curve(
 
     ax.set_xlim(mw_vals.min(), mw_vals.max())
     ax.set_xlabel("Illumination Intensity (mW/mm²)")
-    ax.set_ylabel("No. responsive neurons")
+    ax.set_ylabel("No. responsive\nneurons")
     ax.legend(frameon=False)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -2725,20 +2969,42 @@ def plot_session(result: SessionResult):
     ac = result.anesthesia_state
     ac_color = ANESTHESIA_COLORS.get(ac, ANESTHESIA_COLORS["ketamine"])
     ac_label = ac.title()
+    od = result.output_dir
+
+    # create subfolders
+    ac_dir = od / "activation_curve"
+    pr_dir = od / "psth_responsive"
+    pa_dir = od / "psth_all"
+    pl_dir = od / "psth_layers"
+    ph_dir = od / "psth_heatmap"
+    nr_dir = od / "n_responsive"
+    bc_dir = pr_dir / "baseline_corrected"
+    for d in (ac_dir, pr_dir, pa_dir, pl_dir, ph_dir, nr_dir, bc_dir):
+        d.mkdir(exist_ok=True)
 
     plot_activation_curve(
         result.awake.amplitude_stats,
         result.ketamine.amplitude_stats,
-        result.output_dir / "activation_curve.pdf",
+        ac_dir / "activation_curve.pdf",
         title=result.session_name,
         keta_color=ac_color,
         keta_label=ac_label,
     )
-    # plot 1: responsive cortical neurons only
+    plot_resp_prob_curve(
+        result.awake.resp_prob_df,
+        result.ketamine.resp_prob_df,
+        ac_dir / "response_probability_curve.pdf",
+        title=result.session_name,
+        keta_color=ac_color,
+        keta_label=ac_label,
+    )
+
+    _a_bc = result.awake.bin_centers
+    _k_bc = result.ketamine.bin_centers
     plot_psth(
-        (result.awake.bin_centers, result.awake.psth, result.awake.psth_sem),
-        (result.ketamine.bin_centers, result.ketamine.psth, result.ketamine.psth_sem),
-        result.output_dir / "psth_responsive.pdf",
+        (_a_bc, result.awake.psth, result.awake.psth_sem),
+        (_k_bc, result.ketamine.psth, result.ketamine.psth_sem),
+        pr_dir / "psth_responsive.pdf",
         title=result.session_name,
         awake_raster=result.awake.raster_spikes,
         keta_raster=result.ketamine.raster_spikes,
@@ -2746,7 +3012,18 @@ def plot_session(result: SessionResult):
         keta_color=ac_color,
         keta_label=ac_label,
     )
-    # plot 2a/b/c: all cortical neurons, with optional extra area traces
+    plot_psth(
+        (_a_bc, _bc_psth(_a_bc, result.awake.psth), result.awake.psth_sem),
+        (_k_bc, _bc_psth(_k_bc, result.ketamine.psth), result.ketamine.psth_sem),
+        bc_dir / "psth_responsive.pdf",
+        title=result.session_name,
+        awake_raster=result.awake.raster_spikes,
+        keta_raster=result.ketamine.raster_spikes,
+        window=PSTH_WINDOW_RESPONSIVE,
+        keta_color=ac_color,
+        keta_label=ac_label,
+    )
+
     _awake_all_data = (
         result.awake_all.bin_centers,
         result.awake_all.psth,
@@ -2767,7 +3044,7 @@ def plot_session(result: SessionResult):
     plot_psth(
         _awake_all_data,
         _keta_all_data,
-        result.output_dir / "psth_all_cortex.pdf",
+        pa_dir / "psth_all_cortex.pdf",
         **_psth_all_kwargs,
     )
     for area in ("Th", "Ca1"):
@@ -2775,17 +3052,28 @@ def plot_session(result: SessionResult):
             plot_psth(
                 _awake_all_data,
                 _keta_all_data,
-                result.output_dir / f"psth_all_{area}.pdf",
+                pa_dir / f"psth_all_{area}.pdf",
                 extra_traces=_build_extra_traces(result.area_psths, [area]),
                 **_psth_all_kwargs,
             )
-    plot_psth_layers(
-        result.layer_psths, result.output_dir / "psth_layers_awake.pdf", state="awake"
+
+    _layer_amp_tag = (
+        f"_{int(LAYER_PSTH_AMPLITUDES[0])}_{int(LAYER_PSTH_AMPLITUDES[1])}mW"
+        if LAYER_PSTH_AMPLITUDES is not None
+        else ""
     )
     plot_psth_layers(
-        result.layer_psths, result.output_dir / f"psth_layers_{ac}.pdf", state="keta"
+        result.layer_psths,
+        pl_dir / f"psth_layers_awake{_layer_amp_tag}.pdf",
+        state="awake",
     )
-    plot_psth_heatmap(result, result.output_dir / "psth_heatmap.pdf")
+    plot_psth_layers(
+        result.layer_psths,
+        pl_dir / f"psth_layers_{ac}{_layer_amp_tag}.pdf",
+        state="keta",
+    )
+
+    plot_psth_heatmap(result, ph_dir / "psth_heatmap.pdf")
 
     # per-amplitude plots
     if result.per_amp_psths:
@@ -2799,7 +3087,19 @@ def plot_session(result: SessionResult):
             plot_psth(
                 (a_bc, a_psth, a_sem),
                 (k_bc, k_psth, k_sem),
-                result.output_dir / f"psth_responsive_{amp_tag}.pdf",
+                pr_dir / f"psth_responsive_{amp_tag}.pdf",
+                title=f"{result.session_name} — {mw_str} mW/mm²",
+                psth_stats_df=amp_stats_df,
+                awake_raster=a_raster,
+                keta_raster=k_raster,
+                window=PSTH_WINDOW_RESPONSIVE,
+                keta_color=ac_color,
+                keta_label=ac_label,
+            )
+            plot_psth(
+                (a_bc, _bc_psth(a_bc, a_psth), a_sem),
+                (k_bc, _bc_psth(k_bc, k_psth), k_sem),
+                bc_dir / f"psth_responsive_{amp_tag}.pdf",
                 title=f"{result.session_name} — {mw_str} mW/mm²",
                 psth_stats_df=amp_stats_df,
                 awake_raster=a_raster,
@@ -2810,7 +3110,7 @@ def plot_session(result: SessionResult):
             )
             plot_responsive_counts(
                 [],
-                result.output_dir / f"responsive_counts_{amp_tag}.pdf",
+                nr_dir / f"responsive_counts_{amp_tag}.pdf",
                 keta_color=ac_color,
                 keta_label=ac_label,
                 awake_counts=[data["n_responsive_awake"]],
@@ -2822,7 +3122,7 @@ def plot_session(result: SessionResult):
                 plot_psth(
                     (aa_bc, aa_psth, aa_sem),
                     (ak_bc, ak_psth, ak_sem),
-                    result.output_dir / f"psth_all_cortex_{amp_tag}.pdf",
+                    pa_dir / f"psth_all_cortex_{amp_tag}.pdf",
                     title=f"{result.session_name} — {mw_str} mW/mm² (all)",
                     normalize=True,
                     keta_color=ac_color,
@@ -2830,8 +3130,11 @@ def plot_session(result: SessionResult):
                 )
 
         # pooled-amplitude PSTH for this session
-        if POOLED_AMPLITUDES is not None and result.per_amp_psths:
-            sel_amps = [a for a in POOLED_AMPLITUDES if a in result.per_amp_psths]
+        if POOLED_AMPLITUDES is not None:
+            _pa_lo, _pa_hi = POOLED_AMPLITUDES
+            sel_amps = sorted(
+                [a for a in result.per_amp_psths if _pa_lo <= _volt_to_mw(a) <= _pa_hi]
+            )
             if sel_amps:
                 pa_mats = np.vstack(
                     [result.per_amp_psths[a]["awake"][3] for a in sel_amps]
@@ -2848,22 +3151,29 @@ def plot_session(result: SessionResult):
                 bc = result.per_amp_psths[sel_amps[0]]["awake"][0]
                 n_pool = len(pa_mats)
                 pool_stats_df = run_psth_stats(pa_mats, pk_mats, bc, n_pool)
-                mw_parts = [
+                pool_label = "+".join(
                     f"{_volt_to_mw(a):.1f}".rstrip("0").rstrip(".") for a in sel_amps
-                ]
-                pool_label = "+".join(mw_parts)
+                )
+                _pa_psth = np.mean(pa_mats, axis=0)
+                _pk_psth = np.mean(pk_mats, axis=0)
+                _pa_sem = np.std(pa_mats, axis=0) / np.sqrt(n_pool)
+                _pk_sem = np.std(pk_mats, axis=0) / np.sqrt(n_pool)
                 plot_psth(
-                    (
-                        bc,
-                        np.mean(pa_mats, axis=0),
-                        np.std(pa_mats, axis=0) / np.sqrt(n_pool),
-                    ),
-                    (
-                        bc,
-                        np.mean(pk_mats, axis=0),
-                        np.std(pk_mats, axis=0) / np.sqrt(n_pool),
-                    ),
-                    result.output_dir / f"psth_responsive_combined_{pool_label}.pdf",
+                    (bc, _pa_psth, _pa_sem),
+                    (bc, _pk_psth, _pk_sem),
+                    pr_dir / f"psth_responsive_combined_{pool_label}.pdf",
+                    title=f"{result.session_name} — {pool_label} mW/mm² ({n_pool} neurons)",
+                    psth_stats_df=pool_stats_df,
+                    awake_raster=pa_raster,
+                    keta_raster=pk_raster,
+                    window=PSTH_WINDOW_RESPONSIVE,
+                    keta_color=ac_color,
+                    keta_label=ac_label,
+                )
+                plot_psth(
+                    (bc, _bc_psth(bc, _pa_psth), _pa_sem),
+                    (bc, _bc_psth(bc, _pk_psth), _pk_sem),
+                    bc_dir / f"psth_responsive_combined_{pool_label}.pdf",
                     title=f"{result.session_name} — {pool_label} mW/mm² ({n_pool} neurons)",
                     psth_stats_df=pool_stats_df,
                     awake_raster=pa_raster,
@@ -2874,16 +3184,40 @@ def plot_session(result: SessionResult):
                 )
 
 
+def _process_and_plot_session(args: tuple) -> "SessionResult":
+    """top-level picklable worker: process one session and save its plots."""
+    session_dir, config = args
+    result = process_session(Path(session_dir), config)
+    plot_session(result)
+    return result
+
+
 def main():
     config = load_config()
     with open("sessions.toml", "rb") as f:
         sessions_cfg = tomllib.load(f)
 
-    results = []
-    for d in sessions_cfg["sessions"]["dirs"]:
-        result = process_session(Path(d), config)
-        plot_session(result)
-        results.append(result)
+    dirs = sessions_cfg["sessions"]["dirs"]
+    n_workers = min(
+        len(dirs), N_WORKERS if N_WORKERS is not None else _available_cores()
+    )
+    print(
+        f"{_TEAL}Parallelism: {n_workers} session worker(s) "
+        f"(ZETA sequential per session){_RESET}"
+    )
+
+    if n_workers > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            results = list(
+                ex.map(_process_and_plot_session, [(d, config) for d in dirs])
+            )
+    else:
+        results = [_process_and_plot_session((d, config)) for d in dirs]
+
+    print(f"\n{_TEAL}{'─' * 50}")
+    for r in results:
+        print(f"  {r.session_name}: {len(r.unit_ids)}/{r.n_neurons_total} responsive")
+    print(f"{'─' * 50}{_RESET}\n")
 
     base_pooled_dir = Path(config["files"].get("pooled_output_dir", "output_pooled"))
     base_pooled_dir.mkdir(exist_ok=True)
@@ -2900,17 +3234,35 @@ def main():
         pooled_dir = base_pooled_dir / anesthetic
         pooled_dir.mkdir(exist_ok=True)
 
+        # create subfolders
+        p_ac_dir = pooled_dir / "activation_curve"
+        p_pr_dir = pooled_dir / "psth_responsive"
+        p_pa_dir = pooled_dir / "psth_all"
+        p_pl_dir = pooled_dir / "psth_layers"
+        p_ph_dir = pooled_dir / "psth_heatmap"
+        p_nr_dir = pooled_dir / "n_responsive"
+        p_cal_dir = pooled_dir / "calibration"
+        p_bc_dir = p_pr_dir / "baseline_corrected"
+        for d in (
+            p_ac_dir,
+            p_pr_dir,
+            p_pa_dir,
+            p_pl_dir,
+            p_ph_dir,
+            p_nr_dir,
+            p_cal_dir,
+            p_bc_dir,
+        ):
+            d.mkdir(exist_ok=True)
+
         plot_responsive_counts(
             group,
-            pooled_dir / "responsive_counts.pdf",
+            p_nr_dir / "responsive_counts.pdf",
             keta_color=ac_color,
             keta_label=ac_label,
         )
 
-        print(
-            f"{_TEAL}Calibration fit (degree-3 poly, V→mW/mm²): {np.poly1d(_cal_poly)}{_RESET}"
-        )
-        plot_calibration(pooled_dir / "calibration_fit.pdf")
+        plot_calibration(p_cal_dir / "calibration_fit.pdf")
 
         pooled = pool_sessions(group)
         stats_df = run_stats(
@@ -2919,7 +3271,7 @@ def main():
             pooled["n_neurons"],
             pooled["n_sessions"],
         )
-        stats_df.to_csv(pooled_dir / "activation_curve_stats.csv", index=False)
+        stats_df.to_csv(p_ac_dir / "activation_curve_stats.csv", index=False)
 
         psth_stats_df = run_psth_stats(
             pooled["awake_psths"],
@@ -2927,25 +3279,24 @@ def main():
             pooled["bin_centers"],
             pooled["n_neurons"],
         )
-        psth_stats_df.to_csv(pooled_dir / "psth_stats.csv", index=False)
+        psth_stats_df.to_csv(p_pr_dir / "psth_stats.csv", index=False)
 
-        print(f"\n  Activation thresholds (pooled, {anesthetic}):")
-        awake_thresh = find_activation_threshold(
+        find_activation_threshold(
             pooled["awake_resp"],
             "awake",
-            output_path=pooled_dir / "threshold_awake.csv",
+            output_path=p_ac_dir / "threshold_awake.csv",
         )
-        keta_thresh = find_activation_threshold(
+        find_activation_threshold(
             pooled["keta_resp"],
             anesthetic,
-            output_path=pooled_dir / f"threshold_{anesthetic}.csv",
+            output_path=p_ac_dir / f"threshold_{anesthetic}.csv",
         )
 
         pooled_title = f"Pooled {ac_label} ({pooled['n_neurons']} neurons, {pooled['n_sessions']} sessions)"
         plot_activation_curve(
             pooled["awake_stats"],
             pooled["keta_stats"],
-            pooled_dir / "activation_curve_pooled.pdf",
+            p_ac_dir / "activation_curve_pooled.pdf",
             stats_df=stats_df,
             title=pooled_title,
             keta_color=ac_color,
@@ -2955,7 +3306,7 @@ def main():
         plot_activation_curve(
             pooled["awake_stats"],
             None,
-            pooled_dir / "activation_curve_pooled_awakeOnly.pdf",
+            p_ac_dir / "activation_curve_pooled_awakeOnly.pdf",
             title=pooled_title,
             show_legend=False,
         )
@@ -2972,11 +3323,15 @@ def main():
         else:
             pooled_awake_raster = pooled_keta_raster = []
 
-        # plot 1: responsive cortical neurons only
+        _p_a_bc = pooled["bin_centers"]
+        _p_a_psth = pooled["awake_psth"]
+        _p_k_psth = pooled["keta_psth"]
+        _p_a_sem = pooled["awake_psth_sem"]
+        _p_k_sem = pooled["keta_psth_sem"]
         plot_psth(
-            (pooled["bin_centers"], pooled["awake_psth"], pooled["awake_psth_sem"]),
-            (pooled["bin_centers"], pooled["keta_psth"], pooled["keta_psth_sem"]),
-            pooled_dir / "psth_pooled_responsive.pdf",
+            (_p_a_bc, _p_a_psth, _p_a_sem),
+            (_p_a_bc, _p_k_psth, _p_k_sem),
+            p_pr_dir / "psth_pooled_responsive.pdf",
             title=f"Pooled PSTH ({pooled['n_neurons']} responsive neurons)",
             psth_stats_df=psth_stats_df,
             awake_raster=pooled_awake_raster,
@@ -2985,7 +3340,19 @@ def main():
             keta_color=ac_color,
             keta_label=ac_label,
         )
-        # plot 2a/b/c: all cortical neurons, with optional extra area traces
+        plot_psth(
+            (_p_a_bc, _bc_psth(_p_a_bc, _p_a_psth), _p_a_sem),
+            (_p_a_bc, _bc_psth(_p_a_bc, _p_k_psth), _p_k_sem),
+            p_bc_dir / "psth_pooled_responsive.pdf",
+            title=f"Pooled PSTH ({pooled['n_neurons']} responsive neurons)",
+            psth_stats_df=psth_stats_df,
+            awake_raster=pooled_awake_raster,
+            keta_raster=pooled_keta_raster,
+            window=PSTH_WINDOW_RESPONSIVE,
+            keta_color=ac_color,
+            keta_label=ac_label,
+        )
+
         _awake_all_data = (
             pooled["bin_centers"],
             pooled["awake_all_psth"],
@@ -3006,7 +3373,7 @@ def main():
         plot_psth(
             _awake_all_data,
             _keta_all_data,
-            pooled_dir / "psth_pooled_all_cortex.pdf",
+            p_pa_dir / "psth_pooled_all_cortex.pdf",
             **_psth_all_kwargs,
         )
         for area in ("Th", "Ca1"):
@@ -3014,22 +3381,27 @@ def main():
                 plot_psth(
                     _awake_all_data,
                     _keta_all_data,
-                    pooled_dir / f"psth_pooled_all_{area}.pdf",
+                    p_pa_dir / f"psth_pooled_all_{area}.pdf",
                     extra_traces=_build_extra_traces(pooled["area_psths"], [area]),
                     **_psth_all_kwargs,
                 )
+
+        _layer_amp_tag = (
+            f"_{int(LAYER_PSTH_AMPLITUDES[0])}_{int(LAYER_PSTH_AMPLITUDES[1])}mW"
+            if LAYER_PSTH_AMPLITUDES is not None
+            else ""
+        )
         plot_psth_layers(
             pooled.get("layer_psths"),
-            pooled_dir / "psth_pooled_layers_awake.pdf",
+            p_pl_dir / f"psth_pooled_layers_awake{_layer_amp_tag}.pdf",
             state="awake",
         )
         plot_psth_layers(
             pooled.get("layer_psths"),
-            pooled_dir / f"psth_pooled_layers_{anesthetic}.pdf",
+            p_pl_dir / f"psth_pooled_layers_{anesthetic}{_layer_amp_tag}.pdf",
             state="keta",
         )
 
-        # sort pooled neurons: group by layer (cortical order), then by depth within layer
         layer_order = ["1", "2/3", "4", "5", "6"]
         ci = pooled["heatmap_cluster_info"].copy()
         ci["_layer_rank"] = (
@@ -3051,13 +3423,12 @@ def main():
             ci_sorted,
             pooled["bin_centers"],
             pooled_title,
-            pooled_dir / "psth_heatmap_pooled.pdf",
+            p_ph_dir / "psth_heatmap_pooled.pdf",
             anesthesia_label=ac_label,
         )
-
         plot_psth_heatmap_responsive_comparison(
             group,
-            pooled_dir / "psth_heatmap_responsive_comparison.pdf",
+            p_ph_dir / "psth_heatmap_responsive_comparison.pdf",
             anesthesia_label=ac_label,
         )
 
@@ -3073,7 +3444,19 @@ def main():
             plot_psth(
                 (a_bc, a_psth, a_sem),
                 (k_bc, k_psth, k_sem),
-                pooled_dir / f"psth_pooled_responsive_{amp_tag}.pdf",
+                p_pr_dir / f"psth_pooled_responsive_{amp_tag}.pdf",
+                title=f"Pooled PSTH — {mw_str} mW/mm² ({n_resp} neurons)",
+                psth_stats_df=amp_stats_df,
+                awake_raster=a_raster,
+                keta_raster=k_raster,
+                window=PSTH_WINDOW_RESPONSIVE,
+                keta_color=ac_color,
+                keta_label=ac_label,
+            )
+            plot_psth(
+                (a_bc, _bc_psth(a_bc, a_psth), a_sem),
+                (k_bc, _bc_psth(k_bc, k_psth), k_sem),
+                p_bc_dir / f"psth_pooled_responsive_{amp_tag}.pdf",
                 title=f"Pooled PSTH — {mw_str} mW/mm² ({n_resp} neurons)",
                 psth_stats_df=amp_stats_df,
                 awake_raster=a_raster,
@@ -3084,7 +3467,7 @@ def main():
             )
             plot_responsive_counts(
                 [],
-                pooled_dir / f"responsive_counts_{amp_tag}.pdf",
+                p_nr_dir / f"responsive_counts_{amp_tag}.pdf",
                 keta_color=ac_color,
                 keta_label=ac_label,
                 awake_counts=data.get("n_responsive_awake", []),
@@ -3096,7 +3479,7 @@ def main():
                 plot_psth(
                     (aa_bc, aa_psth, aa_sem),
                     (ak_bc, ak_psth, ak_sem),
-                    pooled_dir / f"psth_pooled_all_cortex_{amp_tag}.pdf",
+                    p_pa_dir / f"psth_pooled_all_cortex_{amp_tag}.pdf",
                     title=f"Pooled PSTH all — {mw_str} mW/mm² ({pooled['n_neurons_all']} neurons)",
                     normalize=True,
                     keta_color=ac_color,
@@ -3106,7 +3489,10 @@ def main():
         # pooled-amplitude PSTH: combine trials from POOLED_AMPLITUDES across sessions
         if POOLED_AMPLITUDES is not None:
             per_amp_data = pooled.get("per_amp_psths", {})
-            sel_amps = [a for a in POOLED_AMPLITUDES if a in per_amp_data]
+            _pa_lo, _pa_hi = POOLED_AMPLITUDES
+            sel_amps = sorted(
+                [a for a in per_amp_data if _pa_lo <= _volt_to_mw(a) <= _pa_hi]
+            )
             if sel_amps:
                 pa_mats = np.vstack([per_amp_data[a]["awake"][3] for a in sel_amps])
                 pk_mats = np.vstack([per_amp_data[a]["keta"][3] for a in sel_amps])
@@ -3115,22 +3501,29 @@ def main():
                 bc = per_amp_data[sel_amps[0]]["awake"][0]
                 n_pool = len(pa_mats)
                 pool_stats_df = run_psth_stats(pa_mats, pk_mats, bc, n_pool)
-                mw_parts = [
+                pool_label = "+".join(
                     f"{_volt_to_mw(a):.1f}".rstrip("0").rstrip(".") for a in sel_amps
-                ]
-                pool_label = "+".join(mw_parts)
+                )
+                _pp_a_psth = np.mean(pa_mats, axis=0)
+                _pp_k_psth = np.mean(pk_mats, axis=0)
+                _pp_a_sem = np.std(pa_mats, axis=0) / np.sqrt(n_pool)
+                _pp_k_sem = np.std(pk_mats, axis=0) / np.sqrt(n_pool)
                 plot_psth(
-                    (
-                        bc,
-                        np.mean(pa_mats, axis=0),
-                        np.std(pa_mats, axis=0) / np.sqrt(n_pool),
-                    ),
-                    (
-                        bc,
-                        np.mean(pk_mats, axis=0),
-                        np.std(pk_mats, axis=0) / np.sqrt(n_pool),
-                    ),
-                    pooled_dir / f"psth_pooled_responsive_combined_{pool_label}.pdf",
+                    (bc, _pp_a_psth, _pp_a_sem),
+                    (bc, _pp_k_psth, _pp_k_sem),
+                    p_pr_dir / f"psth_pooled_responsive_combined_{pool_label}.pdf",
+                    title=f"Pooled PSTH — {pool_label} mW/mm² ({n_pool} neurons)",
+                    psth_stats_df=pool_stats_df,
+                    awake_raster=pa_raster,
+                    keta_raster=pk_raster,
+                    window=PSTH_WINDOW_RESPONSIVE,
+                    keta_color=ac_color,
+                    keta_label=ac_label,
+                )
+                plot_psth(
+                    (bc, _bc_psth(bc, _pp_a_psth), _pp_a_sem),
+                    (bc, _bc_psth(bc, _pp_k_psth), _pp_k_sem),
+                    p_bc_dir / f"psth_pooled_responsive_combined_{pool_label}.pdf",
                     title=f"Pooled PSTH — {pool_label} mW/mm² ({n_pool} neurons)",
                     psth_stats_df=pool_stats_df,
                     awake_raster=pa_raster,
@@ -3144,7 +3537,24 @@ def main():
         plot_firing_rate_comparison(
             pooled["awake_firing_rates"],
             pooled["keta_firing_rates"],
-            pooled_dir / "baseline_FRs.pdf",
+            p_ac_dir / "baseline_FRs.pdf",
+            keta_color=ac_color,
+            keta_label=ac_label,
+        )
+
+        # response probability curve and per-neuron threshold boxplot
+        plot_resp_prob_curve(
+            pooled["awake_resp_prob"],
+            pooled["keta_resp_prob"],
+            p_ac_dir / "response_probability_curve.pdf",
+            title=pooled_title,
+            keta_color=ac_color,
+            keta_label=ac_label,
+        )
+        plot_resp_prob_thresholds(
+            pooled["awake_neuron_thresholds"],
+            pooled["keta_neuron_thresholds"],
+            p_ac_dir / "response_probability_thresholds.pdf",
             keta_color=ac_color,
             keta_label=ac_label,
         )
@@ -3153,39 +3563,32 @@ def main():
         if pooled.get("per_amp_psths"):
             plot_responsive_count_curve(
                 pooled["per_amp_psths"],
-                pooled_dir / "activation_curve_responsive_counts.pdf",
+                p_nr_dir / "activation_curve_responsive_counts.pdf",
                 stats_df=stats_df,
                 keta_color=ac_color,
                 keta_label=ac_label,
                 also_save_log=True,
             )
 
-        # baseline-subtracted activation curve (responsive neurons only)
-        # baseline from all-neurons PSTH (200ms pre-stim) matched to responsive subset by unique_id
-        bc_all = group[
-            0
-        ].awake_all.bin_centers  # all sessions share the same bin_centers
+        # baseline-subtracted activation curve
+        bc_all = group[0].awake_all.bin_centers
         pre_mask_all = bc_all < 0
         a_bl_map, k_bl_map = {}, {}
         for r in group:
-            # awake: map responsive unique_ids → their row in awake_all.neuron_psths
             all_uid_to_row = {u: i for i, u in enumerate(r.awake_all.psth_unit_ids)}
             for uid in r.awake.psth_unit_ids:
                 if uid in all_uid_to_row:
-                    baseline = r.awake_all.neuron_psths[
+                    a_bl_map[f"{r.session_name}_{uid}"] = r.awake_all.neuron_psths[
                         all_uid_to_row[uid], pre_mask_all
                     ].mean()
-                    a_bl_map[f"{r.session_name}_{uid}"] = baseline
-            # keta: same using ketamine_all
             all_uid_to_row_k = {
                 u: i for i, u in enumerate(r.ketamine_all.psth_unit_ids)
             }
             for uid in r.ketamine.psth_unit_ids:
                 if uid in all_uid_to_row_k:
-                    baseline = r.ketamine_all.neuron_psths[
+                    k_bl_map[f"{r.session_name}_{uid}"] = r.ketamine_all.neuron_psths[
                         all_uid_to_row_k[uid], pre_mask_all
                     ].mean()
-                    k_bl_map[f"{r.session_name}_{uid}"] = baseline
         awake_resp_bl = pooled["awake_resp"].copy()
         keta_resp_bl = pooled["keta_resp"].copy()
         awake_resp_bl["response"] -= awake_resp_bl["unique_id"].map(a_bl_map).fillna(0)
@@ -3195,19 +3598,13 @@ def main():
         plot_activation_curve(
             awake_stats_bl,
             keta_stats_bl,
-            pooled_dir / "activation_curve_pooled_baseline_subtracted.pdf",
+            p_ac_dir / "activation_curve_pooled_baseline_subtracted.pdf",
             stats_df=stats_df,
             title=pooled_title + " (baseline subtracted)",
             keta_color=ac_color,
             keta_label=ac_label,
             also_save_log=True,
         )
-
-        sig_amps = stats_df.loc[stats_df["significant"], "amplitude"].tolist()
-        print(
-            f"{_TEAL}\nPooled [{anesthetic}]: {pooled['n_neurons']} neurons across {pooled['n_sessions']} sessions{_RESET}"
-        )
-        print(f"{_TEAL}Significant amplitudes (FDR α={ALPHA}): {sig_amps}{_RESET}")
 
 
 if __name__ == "__main__":

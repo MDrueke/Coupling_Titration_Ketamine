@@ -462,11 +462,7 @@ class Recording:
             keep = self.clusterInfo["group"].isin(("good", "mua"))
         else:  # "all"
             keep = pd.Series(True, index=self.clusterInfo.index)
-        n_total = len(self.clusterInfo)
         self.clusterInfo = self.clusterInfo[keep].reset_index(drop=True)
-        print(
-            f"{_TEAL}\t...Kept {len(self.clusterInfo)}/{n_total} clusters (quality_filter='{quality}'){_RESET}"
-        )
 
         good_ids = set(self.clusterInfo["cluster_id"])
 
@@ -483,7 +479,6 @@ class Recording:
             sample_rate = float(self.APmetaDict.get("imSampRate", 30000.0))
             spike_times = spike_times / sample_rate
             np.save(spike_times_sec_file, spike_times)
-            print(f"{_TEAL}\t...Saved spike times in seconds to {spike_times_sec_file.name}{_RESET}")
 
         spike_clusters_file = ks_dir / "spike_clusters.npy"
         if not spike_clusters_file.exists():
@@ -502,9 +497,6 @@ class Recording:
         spike_arrays = np.split(sorted_times, split_indices[1:])
         self.unitSpikes = dict(zip(unique_clusters, spike_arrays))
 
-        print(
-            f"{_TEAL}\t...Loaded {len(self.clusterInfo)} clusters, {len(spike_times)} spikes{_RESET}"
-        )
 
     def _load_area_depths(self) -> None:
         path = self.paths["areaDepthsPath"]
@@ -549,10 +541,6 @@ class Recording:
             total_removed += n_removed
             self.unitSpikes[unit_id] = spike_times[keep_mask]
 
-        print(
-            f"{_TEAL}\t...Removed {total_removed} refractory violations "
-            f"({refractory_ms}ms) across {len(self.unitSpikes)} units{_RESET}"
-        )
 
     def _assign_layers(self) -> None:
         surface_um = self.surfaceChan * 10  # 10µm spacing
@@ -561,7 +549,6 @@ class Recording:
         self.clusterInfo["layer"] = None
 
         sorted_layers = sorted(self.areaDepths.items(), key=lambda x: x[1][0])
-        print(f"{_TEAL}\t...Layer depth ranges: { {k: v for k, v in sorted_layers} }{_RESET}")
 
         for layer_name, (start_depth, end_depth) in sorted_layers:
             unassigned = self.clusterInfo["layer"].isna()
@@ -570,9 +557,6 @@ class Recording:
             )
             self.clusterInfo.loc[mask, "layer"] = layer_name
 
-        assigned = self.clusterInfo["layer"].notna().sum()
-        total = len(self.clusterInfo)
-        print(f"{_TEAL}\t...Assigned {assigned}/{total} clusters to areas according to area_depths.csv{_RESET}")
 
         self.clusterInfo.to_csv(
             self.paths["ksPath"] / "cluster_info.tsv", sep="\t", index=False
